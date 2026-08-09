@@ -11,6 +11,7 @@ The current release includes:
 - text and `NULL` parameters;
 - named, nullable result cells;
 - connection and read timeouts;
+- reusable authenticated sessions for low-latency services;
 - PostgreSQL server error propagation;
 - trust, cleartext password, MD5 challenge-response, and SCRAM-SHA-256
   authentication;
@@ -55,17 +56,13 @@ default to 3000 and 5000 milliseconds.
 ```abla
 import github("AndreBaltazar8/abla-postgres")
 
-fun findUser(email: string): PgResult {
-    val database = pgConfigFromEnvironment()
-    pgQuery(
-        database,
-        "SELECT id::text AS id, email FROM users WHERE email = \$1",
-        [pgText(email)]
-    )
-}
-
 fun main: int {
-    val found = findUser("alex@example.com")
+    val database = pgClient(pgConfigFromEnvironment())
+    val found = database.query(
+        "SELECT id::text AS id, email FROM users WHERE email = \$1",
+        [pgText("alex@example.com")]
+    )
+    database.close()
     if (!found.succeeded) {
         // found.error contains a bounded connection, protocol, or server error.
         1
@@ -78,6 +75,18 @@ fun main: int {
 The dollar sign is escaped in Abla source (`\$1`) so that PostgreSQL receives
 the literal placeholder. Values remain separate protocol fields and are never
 concatenated into SQL.
+
+For a long-running single-threaded service, retain a `PgClient` locally and use
+`client.query(...)` or `client.execute(...)` for consecutive operations. It
+authenticates lazily on the first query and reuses that connection until
+`client.close()` or a transport failure. `pgQuery(config, ...)` and
+`pgExecute(config, ...)` remain convenient one-shot calls.
+
+Abla deliberately prevents mutable borrowing of a managed global. Servers that
+need a process-wide session can retain an integer descriptor and buffered
+string, then pass them through `pgSessionQuery(...)`; its `PgSessionResult`
+returns the updated scalar state together with the query result. The Mimo demo
+uses this form because its HTTP dispatcher is serial.
 
 Use `pgNull()` for a SQL null value:
 
@@ -184,10 +193,11 @@ until TLS lands. GSSAPI, SSPI, LDAP, PAM, peer, and certificate authentication
 are server/infrastructure mechanisms rather than PostgreSQL password exchanges
 and are outside this client module.
 
-Each query currently opens one bounded connection. This prioritizes a small,
-auditable implementation and correct failure behavior; pooling, prepared
-statement reuse, transactions, binary values, and cancellation are future
-additions.
+One-shot helpers open one bounded connection per call. `PgClient` and
+`pgSessionQuery` reuse an authenticated connection and drain ordinary SQL
+errors through `ReadyForQuery`, while transport failures invalidate the session
+so the next call reconnects. Concurrent connection pooling, prepared statement
+reuse, transactions, binary values, and cancellation are future additions.
 
 ## License
 

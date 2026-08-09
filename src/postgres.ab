@@ -63,6 +63,32 @@ class PgMessage(val kind: int, val body: string, val valid: bool)
 
 class PgStream(val connection: TcpConnection, var buffered: string)
 
+// A reusable authenticated PostgreSQL session. The server-side HTTP runtime is
+// currently single-threaded, so one client can safely serve consecutive
+// requests without paying the TCP and authentication cost for every query.
+class PgClient(
+    val config: PgConfig,
+    var stream: PgStream,
+    var authenticated: bool
+)
+
+// A value-shaped bridge for long-lived application state. Abla intentionally
+// does not allow mutable borrowing of a managed object stored globally, so
+// servers can retain these scalar fields and feed them into pgSessionQuery.
+class PgSessionResult(
+    val descriptor: int,
+    val buffered: string,
+    val result: PgResult
+)
+
+fun pgDisconnectedStream(): PgStream = PgStream(TcpConnection(-1), "")
+
+fun pgClient(config: PgConfig): PgClient = PgClient(
+    config,
+    pgDisconnectedStream(),
+    false
+)
+
 fun pgEnvironment(name: string, fallback: string): string {
     val configured = linuxEnvironment(name)
     if (configured.found && configured.value != "") configured.value else fallback
@@ -495,39 +521,104 @@ fun pgExtendedQuery(sql: string, parameters: array<PgParameter>): string {
     "$parsed$bound$described$executed$synced"
 }
 
-fun pgQuery(
-    config: PgConfig,
+fun PgClient.disconnect(): void {
+    if (this.stream.connection.descriptor >= 0) this.stream.connection.close()
+    this.stream = pgDisconnectedStream()
+    this.authenticated = false
+    return
+}
+
+fun PgClient.connect(): string {
+    this.disconnect()
+    this.stream = pgConnect(this.config)
+    val error = pgAuthenticate(this.stream, this.config)
+    if (error == "") this.authenticated = true
+    else this.disconnect()
+    error
+}
+
+fun PgClient.query(
     sql: string,
     parameters: array<PgParameter> = []
 ): PgResult {
-    var stream = pgConnect(config)
-    var error = pgAuthenticate(stream, config)
+    var error = ""
+    if (!this.authenticated) error = this.connect()
     val columns: array<string> = []
     val rows: array<array<PgValue>> = []
     var command = ""
+    var transportFailed = false
     if (error == "") {
         val request = pgExtendedQuery(sql, parameters)
-        if (stream.connection.write(request) < 0) error = "Could not send PostgreSQL query"
+        if (this.stream.connection.write(request) < 0) {
+            error = "Could not send PostgreSQL query"
+            transportFailed = true
+        }
     }
     var ready = false
-    while (!ready && error == "") {
-        val message = stream.next(config.readTimeoutMilliseconds)
-        if (!message.valid) error = "Timed out while reading PostgreSQL query result"
-        else if (message.kind == 69) error = pgErrorMessage(message.body)
-        else if (message.kind == 84) {
+    // PostgreSQL sends ReadyForQuery after an ordinary SQL error. Drain through
+    // it so the persistent connection stays protocol-aligned and reusable.
+    while (!ready && !transportFailed) {
+        val message = this.stream.next(this.config.readTimeoutMilliseconds)
+        if (!message.valid) {
+            if (error == "") {
+                error = "Timed out while reading PostgreSQL query result"
+            }
+            transportFailed = true
+        } else if (message.kind == 69) error = pgErrorMessage(message.body)
+        else if (message.kind == 84 && error == "") {
             val described = pgParseColumns(message.body)
             var index = 0
             while (index < described.size) {
                 columns.append(described[index])
                 index = index + 1
             }
-        } else if (message.kind == 68) rows.append(pgParseRow(message.body))
-        else if (message.kind == 67 && message.body.size > 0) {
+        } else if (message.kind == 68 && error == "") {
+            rows.append(pgParseRow(message.body))
+        } else if (message.kind == 67 && message.body.size > 0 &&
+            error == "") {
             command = message.body.slice(0, message.body.size - 1)
         } else if (message.kind == 90) ready = true
     }
-    if (stream.connection.descriptor >= 0) stream.connection.close()
-    PgResult(error == "", columns, rows, command, error)
+    if (transportFailed) this.disconnect()
+    PgResult(error == "" && ready, columns, rows, command, error)
+}
+
+fun PgClient.execute(
+    sql: string,
+    parameters: array<PgParameter> = []
+): PgResult = this.query(sql, parameters)
+
+fun PgClient.close(): void = this.disconnect()
+
+fun pgSessionQuery(
+    config: PgConfig,
+    descriptor: int,
+    buffered: string,
+    sql: string,
+    parameters: array<PgParameter> = []
+): PgSessionResult {
+    val client = PgClient(
+        config,
+        PgStream(TcpConnection(descriptor), buffered),
+        descriptor >= 0
+    )
+    val result = client.query(sql, parameters)
+    PgSessionResult(
+        client.stream.connection.descriptor,
+        client.stream.buffered,
+        result
+    )
+}
+
+fun pgQuery(
+    config: PgConfig,
+    sql: string,
+    parameters: array<PgParameter> = []
+): PgResult {
+    val client = pgClient(config)
+    val result = client.query(sql, parameters)
+    client.close()
+    result
 }
 
 fun pgExecute(

@@ -2,22 +2,32 @@ import "../src/postgres.ab"
 
 fun main: int {
     val config = pgConfigFromEnvironment()
-    val created = pgExecute(config,
+    val client = pgClient(config)
+    val created = client.execute(
         "CREATE TABLE IF NOT EXISTS abla_probe (id bigint PRIMARY KEY, value text NOT NULL)",
         [])
-    val written = pgExecute(config,
+    val written = client.execute(
         "INSERT INTO abla_probe(id, value) VALUES (\$1, \$2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value",
         [pgText("1"), pgText("O'Reilly from Abla")]
     )
-    val selected = pgQuery(config,
+    val selected = client.query(
         "SELECT value, NULL::text AS optional FROM abla_probe WHERE id = \$1",
         [pgText("1")]
     )
+    val invalid = client.query("SELECT abla_missing_column", [])
+    val afterError = client.query("SELECT 'ready' AS state", [])
+    client.close()
+    val afterReconnect = client.query("SELECT 'reconnected' AS state", [])
+    client.close()
     if (!created.succeeded) 10
     else if (!written.succeeded) 20
     else if (!selected.succeeded) 30
     else if (selected.rows.size != 1) 40
     else if (selected.first("value") != "O'Reilly from Abla") 50
     else if (!selected.rows[0][1].isNull) 60
+    else if (invalid.succeeded || invalid.error == "") 70
+    else if (!afterError.succeeded || afterError.first("state") != "ready") 80
+    else if (!afterReconnect.succeeded ||
+        afterReconnect.first("state") != "reconnected") 90
     else 0
 }
