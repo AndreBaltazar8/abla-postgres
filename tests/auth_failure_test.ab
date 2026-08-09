@@ -1,0 +1,6 @@
+import "../src/postgres.ab"
+
+fun main: int {
+    val result = pgQuery(pgConfigFromEnvironment(), "SELECT 1", [])
+    if (!result.succeeded && result.error != "") 0 else 1
+}

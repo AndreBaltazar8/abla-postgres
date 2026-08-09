@@ -1,24 +1,46 @@
 # Deploying with Icy
 
-The supported 0.1 deployment shape is one private Icy PostgreSQL service and
-one Abla service on the same overlay network.
+The recommended deployment is one private Icy PostgreSQL service and one Abla
+service on the same overlay network, authenticated with SCRAM-SHA-256.
 
 Use the generated service name as `POSTGRES_HOST`. For a project named
-`abla-food` and a service named `database`, that name is
+`abla-food` and service named `database`, that name is
 `abla-food_database`.
 
-The Postgres service must use `POSTGRES_HOST_AUTH_METHOD=trust` until the
-client implements SCRAM. This is acceptable only when all of the following
-remain true:
+Create `secrets/production.yaml` locally:
 
-- the service has no published port;
-- only trusted workloads join the overlay network;
-- the database container and Icy deployment are access controlled; and
-- backups and operational access are handled separately.
+```yaml
+POSTGRES_PASSWORD_FILE: a-long-random-password
+```
 
-The application should run idempotent migrations before serving data or use a
-dedicated migration executable. The Mimo sample currently demonstrates the
-former so that a new Icy volume can bootstrap without another runtime.
+List `POSTGRES_PASSWORD_FILE` in both services' `envs` arrays. Icy mounts the
+secret and sets the environment variable to its path. The official Postgres
+image and `pgConfigFromEnvironment()` both read that file.
 
-The `abla-prebuilt` Alpine image includes the platform resolver used for Icy
-service-name lookup. Numeric IPv4 hosts skip that process entirely.
+Set these ordinary target variables:
+
+```jsonnet
+envs: {
+  POSTGRES_HOST: 'abla-food_database',
+  POSTGRES_DB: 'abla_food',
+  POSTGRES_USER: 'postgres',
+  POSTGRES_HOST_AUTH_METHOD: 'scram-sha-256',
+},
+```
+
+Do not set `published_port` or `expose_ports` in production. SCRAM protects
+the password and mutually verifies the proof exchange, while the private
+overlay limits exposure of query traffic until TLS transport is implemented.
+
+## Existing trust-authenticated volumes
+
+Adding `POSTGRES_PASSWORD_FILE` does not change the password of an existing
+Postgres role. Migrate without locking the application out:
+
+1. deploy the secret to both services while the HBA method remains `trust`;
+2. inside the database service, set the role password from the mounted secret
+   while `password_encryption` is `scram-sha-256`;
+3. change `POSTGRES_HOST_AUTH_METHOD` to `scram-sha-256`; and
+4. redeploy and verify a fresh application connection.
+
+New volumes initialize directly with the secret and SCRAM method.

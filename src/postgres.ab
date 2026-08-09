@@ -5,12 +5,14 @@
 
 import "abla/sys/linux/net"
 import "abla/sys/linux/process"
+import "crypto.ab"
 
 class PgConfig(
     val host: string,
     val port: int,
     val database: string,
     val user: string,
+    val password: string,
     val connectTimeoutMilliseconds: int = 3000,
     val readTimeoutMilliseconds: int = 5000
 )
@@ -66,6 +68,27 @@ fun pgEnvironment(name: string, fallback: string): string {
     if (configured.found && configured.value != "") configured.value else fallback
 }
 
+fun pgSecretEnvironment(
+    name: string,
+    fileName: string,
+    fallback: string
+): string {
+    val direct = linuxEnvironment(name)
+    var result = fallback
+    if (direct.found) result = direct.value
+    else {
+        val configuredFile = linuxEnvironment(fileName)
+        if (configuredFile.found && configuredFile.value != "") {
+            val contents = linuxReadFile(configuredFile.value, 65536)
+            var end = contents.size
+            while (end > 0 && (contents[end - 1] == 10 ||
+                contents[end - 1] == 13)) end = end - 1
+            if (end > 0) result = contents.slice(0, end)
+        }
+    }
+    result
+}
+
 fun pgParsePositiveInt(value: string, fallback: int): int {
     var parsed = 0
     var valid = value.size > 0
@@ -103,6 +126,7 @@ fun pgConfigFromEnvironment(): PgConfig = PgConfig(
     pgParsePositiveInt(pgEnvironment("POSTGRES_PORT", "5432"), 5432),
     pgEnvironment("POSTGRES_DB", "postgres"),
     pgEnvironment("POSTGRES_USER", "postgres"),
+    pgSecretEnvironment("POSTGRES_PASSWORD", "POSTGRES_PASSWORD_FILE", ""),
     pgParsePositiveInt(pgEnvironment("POSTGRES_CONNECT_TIMEOUT_MS", "3000"), 3000),
     pgParsePositiveInt(pgEnvironment("POSTGRES_READ_TIMEOUT_MS", "5000"), 5000)
 )
@@ -249,6 +273,38 @@ fun pgConnect(config: PgConfig): PgStream {
     )
 }
 
+fun pgPasswordMessage(value: string): string {
+    val body: array<int> = []
+    pgAppendCString(body, value)
+    pgTypedMessage(112, body)
+}
+
+fun pgSaslInitialMessage(initial: string): string {
+    val body: array<int> = []
+    pgAppendCString(body, "SCRAM-SHA-256")
+    pgAppendU32(body, initial.size)
+    pgAppendText(body, initial)
+    pgTypedMessage(112, body)
+}
+
+fun pgSaslResponseMessage(response: string): string {
+    val body: array<int> = []
+    pgAppendText(body, response)
+    pgTypedMessage(112, body)
+}
+
+fun pgAuthenticationOffers(body: string, mechanism: string): bool {
+    var found = false
+    var index = 4
+    while (index < body.size && body[index] != 0) {
+        val begin = index
+        while (index < body.size && body[index] != 0) index = index + 1
+        if (body.slice(begin, index) == mechanism) found = true
+        index = index + 1
+    }
+    found
+}
+
 fun pgAuthenticate(var stream: PgStream, config: PgConfig): string {
     var error = ""
     if (stream.connection.descriptor < 0) {
@@ -257,15 +313,108 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig): string {
         error = "Could not send PostgreSQL startup message"
     } else {
         var ready = false
+        var authenticationOk = false
+        var passwordResponseSent = false
+        var clientFirstBare = ""
+        var expectedServerSignature = ""
+        var scramVerified = false
         while (!ready && error == "") {
             val message = stream.next(config.readTimeoutMilliseconds)
             if (!message.valid) error = "Timed out during PostgreSQL startup"
             else if (message.kind == 69) error = pgErrorMessage(message.body)
             else if (message.kind == 82) {
-                if (message.body.size < 4 || pgReadU32(message.body, 0) != 0) {
-                    error = "PostgreSQL authentication mode is not supported; configure the private Icy database service with trust authentication"
+                if (message.body.size < 4) {
+                    error = "PostgreSQL sent a malformed authentication message"
+                } else {
+                    val method = pgReadU32(message.body, 0)
+                    if (method == 0) {
+                        if (clientFirstBare != "" && !scramVerified) {
+                            error = "PostgreSQL completed SCRAM without a verified server proof"
+                        } else authenticationOk = true
+                    } else if (method == 3) {
+                        if (passwordResponseSent) {
+                            error = "PostgreSQL requested a duplicate password response"
+                        } else {
+                            passwordResponseSent = true
+                            if (stream.connection.write(
+                                pgPasswordMessage(config.password)
+                            ) < 0) error = "Could not send PostgreSQL password"
+                        }
+                    } else if (method == 5) {
+                        if (passwordResponseSent || message.body.size != 8) {
+                            error = "PostgreSQL sent an invalid MD5 password challenge"
+                        } else {
+                            passwordResponseSent = true
+                            val response = pgMd5PasswordResponse(
+                                config.user,
+                                config.password,
+                                message.body.slice(4, 8)
+                            )
+                            if (response == "" || stream.connection.write(
+                                pgPasswordMessage(response)
+                            ) < 0) error = "Could not send PostgreSQL MD5 password response"
+                        }
+                    } else if (method == 10) {
+                        if (clientFirstBare != "" ||
+                            !pgAuthenticationOffers(
+                                message.body, "SCRAM-SHA-256"
+                            )) {
+                            error = "PostgreSQL did not offer a supported SASL mechanism"
+                        } else {
+                            val nonce = pgSecureNonce()
+                            if (nonce == "") {
+                                error = "Could not generate a secure PostgreSQL SCRAM nonce"
+                            } else {
+                                clientFirstBare =
+                                    "n=${pgSaslName(config.user)},r=$nonce"
+                                val initial = "n,,$clientFirstBare"
+                                if (stream.connection.write(
+                                    pgSaslInitialMessage(initial)
+                                ) < 0) error = "Could not begin PostgreSQL SCRAM authentication"
+                            }
+                        }
+                    } else if (method == 11) {
+                        if (clientFirstBare == "" ||
+                            expectedServerSignature != "") {
+                            error = "PostgreSQL sent an unexpected SCRAM continuation"
+                        } else {
+                            val proof = pgScramProof(
+                                config.password,
+                                clientFirstBare,
+                                message.body.slice(4, message.body.size)
+                            )
+                            if (proof.error != "") error = proof.error
+                            else {
+                                expectedServerSignature = proof.serverSignature
+                                if (stream.connection.write(
+                                    pgSaslResponseMessage(proof.clientFinal)
+                                ) < 0) error = "Could not send PostgreSQL SCRAM proof"
+                            }
+                        }
+                    } else if (method == 12) {
+                        if (expectedServerSignature == "") {
+                            error = "PostgreSQL sent an unexpected SCRAM final message"
+                        } else {
+                            val outcome = message.body.slice(4, message.body.size)
+                            val serverError = pgScramAttribute(outcome, 101)
+                            val verifier = pgScramAttribute(outcome, 118)
+                            if (serverError != "") {
+                                error = "PostgreSQL SCRAM authentication failed: $serverError"
+                            } else if (!pgConstantTimeEqual(
+                                verifier, expectedServerSignature
+                            )) {
+                                error = "PostgreSQL SCRAM server proof verification failed"
+                            } else scramVerified = true
+                        }
+                    } else {
+                        error = "PostgreSQL authentication method $method is not supported"
+                    }
                 }
-            } else if (message.kind == 90) ready = true
+            } else if (message.kind == 90) {
+                if (!authenticationOk) {
+                    error = "PostgreSQL became ready before authentication completed"
+                } else ready = true
+            }
         }
     }
     error
