@@ -1,0 +1,4 @@
+name = "abla-postgres"
+version = "0.1.0"
+entry = "src/postgres.ab"
+

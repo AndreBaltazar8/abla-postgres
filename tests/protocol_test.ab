@@ -1,0 +1,23 @@
+import "../src/postgres.ab"
+
+fun main: int {
+    val config = pgConfigFromEnvironment()
+    val created = pgExecute(config,
+        "CREATE TABLE IF NOT EXISTS abla_probe (id bigint PRIMARY KEY, value text NOT NULL)",
+        [])
+    val written = pgExecute(config,
+        "INSERT INTO abla_probe(id, value) VALUES (\$1, \$2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value",
+        [pgText("1"), pgText("O'Reilly from Abla")]
+    )
+    val selected = pgQuery(config,
+        "SELECT value, NULL::text AS optional FROM abla_probe WHERE id = \$1",
+        [pgText("1")]
+    )
+    if (!created.succeeded) 10
+    else if (!written.succeeded) 20
+    else if (!selected.succeeded) 30
+    else if (selected.rows.size != 1) 40
+    else if (selected.first("value") != "O'Reilly from Abla") 50
+    else if (!selected.rows[0][1].isNull) 60
+    else 0
+}

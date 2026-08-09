@@ -1,0 +1,388 @@
+// A small PostgreSQL v3 wire-protocol client for Linux Abla services.
+//
+// The client deliberately uses the extended query protocol. Values are sent
+// separately from SQL text, so applications do not need to quote user input.
+
+import "abla/sys/linux/net"
+import "abla/sys/linux/process"
+
+class PgConfig(
+    val host: string,
+    val port: int,
+    val database: string,
+    val user: string,
+    val connectTimeoutMilliseconds: int = 3000,
+    val readTimeoutMilliseconds: int = 5000
+)
+
+class PgParameter(val value: string, val isNull: bool)
+
+fun pgText(value: string): PgParameter = PgParameter(value, false)
+
+fun pgNull(): PgParameter = PgParameter("", true)
+
+class PgValue(val value: string, val isNull: bool)
+
+class PgResult(
+    val succeeded: bool,
+    val columns: array<string>,
+    val rows: array<array<PgValue>>,
+    val command: string,
+    val error: string
+) {
+    fun first(column: string): string {
+        var result = ""
+        var index = 0
+        while (index < this.columns.size) {
+            if (this.columns[index] == column && this.rows.size > 0 &&
+                index < this.rows[0].size && !this.rows[0][index].isNull) {
+                result = this.rows[0][index].value
+            }
+            index = index + 1
+        }
+        result
+    }
+
+    fun cell(row: int, column: string): PgValue {
+        var result = PgValue("", true)
+        var index = 0
+        while (index < this.columns.size) {
+            if (this.columns[index] == column && row >= 0 &&
+                row < this.rows.size && index < this.rows[row].size) {
+                result = this.rows[row][index]
+            }
+            index = index + 1
+        }
+        result
+    }
+}
+
+class PgMessage(val kind: int, val body: string, val valid: bool)
+
+class PgStream(val connection: TcpConnection, var buffered: string)
+
+fun pgEnvironment(name: string, fallback: string): string {
+    val configured = linuxEnvironment(name)
+    if (configured.found && configured.value != "") configured.value else fallback
+}
+
+fun pgParsePositiveInt(value: string, fallback: int): int {
+    var parsed = 0
+    var valid = value.size > 0
+    var index = 0
+    while (valid && index < value.size) {
+        val digit = value[index] - 48
+        if (digit < 0 || digit > 9) valid = false
+        else parsed = parsed * 10 + digit
+        index = index + 1
+    }
+    if (valid && parsed > 0) parsed else fallback
+}
+
+fun pgInt(value: string, fallback: int = 0): int {
+    var parsed = 0
+    var sign = 1
+    var index = 0
+    var valid = value.size > 0
+    if (valid && value[0] == 45) {
+        sign = -1
+        index = 1
+        if (index == value.size) valid = false
+    }
+    while (valid && index < value.size) {
+        val digit = value[index] - 48
+        if (digit < 0 || digit > 9) valid = false
+        else parsed = parsed * 10 + digit
+        index = index + 1
+    }
+    if (valid) parsed * sign else fallback
+}
+
+fun pgConfigFromEnvironment(): PgConfig = PgConfig(
+    pgEnvironment("POSTGRES_HOST", "127.0.0.1"),
+    pgParsePositiveInt(pgEnvironment("POSTGRES_PORT", "5432"), 5432),
+    pgEnvironment("POSTGRES_DB", "postgres"),
+    pgEnvironment("POSTGRES_USER", "postgres"),
+    pgParsePositiveInt(pgEnvironment("POSTGRES_CONNECT_TIMEOUT_MS", "3000"), 3000),
+    pgParsePositiveInt(pgEnvironment("POSTGRES_READ_TIMEOUT_MS", "5000"), 5000)
+)
+
+fun pgAppendU16(var bytes: array<int>, value: int): void {
+    bytes.append(value / 256)
+    bytes.append(value - value / 256 * 256)
+}
+
+fun pgAppendU32(var bytes: array<int>, value: int): void {
+    bytes.append(value / 16777216)
+    bytes.append(value / 65536 - value / 16777216 * 256)
+    bytes.append(value / 256 - value / 65536 * 256)
+    bytes.append(value - value / 256 * 256)
+}
+
+fun pgAppendText(var bytes: array<int>, value: string): void {
+    var index = 0
+    while (index < value.size) {
+        bytes.append(value[index])
+        index = index + 1
+    }
+}
+
+fun pgAppendCString(var bytes: array<int>, value: string): void {
+    pgAppendText(bytes, value)
+    bytes.append(0)
+}
+
+fun pgBytes(bytes: array<int>): string {
+    val buffer = nativeByteBuffer(bytes.size + 1)
+    var index = 0
+    while (index < bytes.size) {
+        buffer.store(index, bytes[index])
+        index = index + 1
+    }
+    buffer.adoptString(bytes.size)
+}
+
+fun pgTypedMessage(kind: int, body: array<int>): string {
+    val bytes: array<int> = [kind]
+    pgAppendU32(bytes, body.size + 4)
+    var index = 0
+    while (index < body.size) {
+        bytes.append(body[index])
+        index = index + 1
+    }
+    pgBytes(bytes)
+}
+
+fun pgReadU16(value: string, offset: int): int =
+    value[offset] * 256 + value[offset + 1]
+
+fun pgReadU32(value: string, offset: int): int =
+    value[offset] * 16777216 + value[offset + 1] * 65536 +
+    value[offset + 2] * 256 + value[offset + 3]
+
+fun PgStream.next(timeoutMilliseconds: int): PgMessage {
+    var attempts = 0
+    var enough = this.buffered.size >= 5
+    var total = 0
+    if (enough) total = 1 + pgReadU32(this.buffered, 1)
+    while (attempts < 20 && (!enough || this.buffered.size < total)) {
+        val slice = if (timeoutMilliseconds < 250) timeoutMilliseconds else 250
+        val chunk = this.connection.readWithTimeout(65536, slice)
+        if (chunk.size > 0) this.buffered = "${this.buffered}$chunk"
+        attempts = attempts + 1
+        enough = this.buffered.size >= 5
+        if (enough) total = 1 + pgReadU32(this.buffered, 1)
+    }
+    var result = PgMessage(0, "", false)
+    if (enough && total >= 5 && total <= 16777216 &&
+        this.buffered.size >= total) {
+        result = PgMessage(
+            this.buffered[0],
+            this.buffered.slice(5, total),
+            true
+        )
+        this.buffered = this.buffered.slice(total, this.buffered.size)
+    }
+    result
+}
+
+fun pgResolveIpv4(host: string): string {
+    val parsed = linuxIpv4Octets(host)
+    var result = host
+    if (parsed.size != 4) {
+        val command = linuxCommand("getent")
+        command.argument("ahostsv4")
+        command.argument(host)
+        val lookup = command.capture()
+        result = ""
+        if (lookup.status == 0) {
+            var end = 0
+            while (end < lookup.output.size && lookup.output[end] != 32 &&
+                lookup.output[end] != 9 && lookup.output[end] != 10) {
+                end = end + 1
+            }
+            if (end > 0) result = lookup.output.slice(0, end)
+        }
+    }
+    result
+}
+
+fun pgStartup(config: PgConfig): array<int> {
+    val body: array<int> = []
+    pgAppendU32(body, 196608)
+    pgAppendCString(body, "user")
+    pgAppendCString(body, config.user)
+    pgAppendCString(body, "database")
+    pgAppendCString(body, config.database)
+    pgAppendCString(body, "application_name")
+    pgAppendCString(body, "abla-postgres")
+    body.append(0)
+    val packet: array<int> = []
+    pgAppendU32(packet, body.size + 4)
+    var index = 0
+    while (index < body.size) {
+        packet.append(body[index])
+        index = index + 1
+    }
+    packet
+}
+
+fun pgErrorMessage(body: string): string {
+    var message = "PostgreSQL error"
+    var index = 0
+    while (index < body.size && body[index] != 0) {
+        val field = body[index]
+        index = index + 1
+        val begin = index
+        while (index < body.size && body[index] != 0) index = index + 1
+        if (field == 77) message = body.slice(begin, index)
+        index = index + 1
+    }
+    message
+}
+
+fun pgConnect(config: PgConfig): PgStream {
+    val address = pgResolveIpv4(config.host)
+    PgStream(
+        tcpConnectIpv4(address, config.port, config.connectTimeoutMilliseconds),
+        ""
+    )
+}
+
+fun pgAuthenticate(var stream: PgStream, config: PgConfig): string {
+    var error = ""
+    if (stream.connection.descriptor < 0) {
+        error = "Could not connect to PostgreSQL at ${config.host}:${config.port}"
+    } else if (stream.connection.write(pgBytes(pgStartup(config))) < 0) {
+        error = "Could not send PostgreSQL startup message"
+    } else {
+        var ready = false
+        while (!ready && error == "") {
+            val message = stream.next(config.readTimeoutMilliseconds)
+            if (!message.valid) error = "Timed out during PostgreSQL startup"
+            else if (message.kind == 69) error = pgErrorMessage(message.body)
+            else if (message.kind == 82) {
+                if (message.body.size < 4 || pgReadU32(message.body, 0) != 0) {
+                    error = "PostgreSQL authentication mode is not supported; configure the private Icy database service with trust authentication"
+                }
+            } else if (message.kind == 90) ready = true
+        }
+    }
+    error
+}
+
+fun pgParseColumns(body: string): array<string> {
+    val columns: array<string> = []
+    if (body.size >= 2) {
+        val count = pgReadU16(body, 0)
+        var index = 2
+        var column = 0
+        while (column < count && index < body.size) {
+            val begin = index
+            while (index < body.size && body[index] != 0) index = index + 1
+            columns.append(body.slice(begin, index))
+            index = index + 19
+            column = column + 1
+        }
+    }
+    columns
+}
+
+fun pgParseRow(body: string): array<PgValue> {
+    val row: array<PgValue> = []
+    if (body.size >= 2) {
+        val count = pgReadU16(body, 0)
+        var index = 2
+        var column = 0
+        while (column < count && index + 4 <= body.size) {
+            val length = pgReadU32(body, index)
+            index = index + 4
+            if (length == 4294967295) row.append(PgValue("", true))
+            else if (length >= 0 && index + length <= body.size) {
+                row.append(PgValue(body.slice(index, index + length), false))
+                index = index + length
+            }
+            column = column + 1
+        }
+    }
+    row
+}
+
+fun pgExtendedQuery(sql: string, parameters: array<PgParameter>): string {
+    val parse: array<int> = []
+    parse.append(0)
+    pgAppendCString(parse, sql)
+    pgAppendU16(parse, 0)
+
+    val bind: array<int> = []
+    bind.append(0)
+    bind.append(0)
+    pgAppendU16(bind, 0)
+    pgAppendU16(bind, parameters.size)
+    var index = 0
+    while (index < parameters.size) {
+        val parameter = parameters[index]
+        if (parameter.isNull) {
+            bind.append(255)
+            bind.append(255)
+            bind.append(255)
+            bind.append(255)
+        } else {
+            pgAppendU32(bind, parameter.value.size)
+            pgAppendText(bind, parameter.value)
+        }
+        index = index + 1
+    }
+    pgAppendU16(bind, 0)
+
+    val describe: array<int> = [80, 0]
+    val execute: array<int> = [0, 0, 0, 0, 0]
+    val empty: array<int> = []
+    val parsed = pgTypedMessage(80, parse)
+    val bound = pgTypedMessage(66, bind)
+    val described = pgTypedMessage(68, describe)
+    val executed = pgTypedMessage(69, execute)
+    val synced = pgTypedMessage(83, empty)
+    "$parsed$bound$described$executed$synced"
+}
+
+fun pgQuery(
+    config: PgConfig,
+    sql: string,
+    parameters: array<PgParameter> = []
+): PgResult {
+    var stream = pgConnect(config)
+    var error = pgAuthenticate(stream, config)
+    val columns: array<string> = []
+    val rows: array<array<PgValue>> = []
+    var command = ""
+    if (error == "") {
+        val request = pgExtendedQuery(sql, parameters)
+        if (stream.connection.write(request) < 0) error = "Could not send PostgreSQL query"
+    }
+    var ready = false
+    while (!ready && error == "") {
+        val message = stream.next(config.readTimeoutMilliseconds)
+        if (!message.valid) error = "Timed out while reading PostgreSQL query result"
+        else if (message.kind == 69) error = pgErrorMessage(message.body)
+        else if (message.kind == 84) {
+            val described = pgParseColumns(message.body)
+            var index = 0
+            while (index < described.size) {
+                columns.append(described[index])
+                index = index + 1
+            }
+        } else if (message.kind == 68) rows.append(pgParseRow(message.body))
+        else if (message.kind == 67 && message.body.size > 0) {
+            command = message.body.slice(0, message.body.size - 1)
+        } else if (message.kind == 90) ready = true
+    }
+    if (stream.connection.descriptor >= 0) stream.connection.close()
+    PgResult(error == "", columns, rows, command, error)
+}
+
+fun pgExecute(
+    config: PgConfig,
+    sql: string,
+    parameters: array<PgParameter> = []
+): PgResult = pgQuery(config, sql, parameters)

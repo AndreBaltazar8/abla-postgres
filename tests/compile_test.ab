@@ -1,0 +1,3 @@
+import "../src/postgres.ab"
+
+fun main: int = 0
