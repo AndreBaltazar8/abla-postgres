@@ -605,9 +605,15 @@ fun pgSessionQuery(
         descriptor >= 0
     )
     val result = client.query(sql, parameters)
+    val nextDescriptor = client.stream.connection.descriptor
+    val nextBuffered = client.stream.buffered
+    // The scalar session bridge transfers descriptor ownership back to the
+    // caller. Prevent structural cleanup of the temporary client from closing
+    // the reusable socket as this function returns.
+    client.stream.connection.descriptor = -1
     PgSessionResult(
-        client.stream.connection.descriptor,
-        client.stream.buffered,
+        nextDescriptor,
+        nextBuffered,
         result
     )
 }

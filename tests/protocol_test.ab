@@ -20,6 +20,19 @@ fun main: int {
     client.close()
     val afterReconnect = client.query("SELECT 'reconnected' AS state", [])
     client.close()
+    val firstSession = pgSessionQuery(
+        config, -1, "", "SELECT 'first' AS state", []
+    )
+    val secondSession = pgSessionQuery(
+        config,
+        firstSession.descriptor,
+        firstSession.buffered,
+        "SELECT 'second' AS state",
+        []
+    )
+    val reusableDescriptor = secondSession.descriptor
+    val sessionConnection = TcpConnection(reusableDescriptor)
+    sessionConnection.close()
     if (!created.succeeded) {
         eprintln("create failed: ${created.error}")
         10
@@ -37,5 +50,10 @@ fun main: int {
     else if (!afterError.succeeded || afterError.first("state") != "ready") 80
     else if (!afterReconnect.succeeded ||
         afterReconnect.first("state") != "reconnected") 90
+    else if (!firstSession.result.succeeded ||
+        firstSession.result.first("state") != "first" ||
+        !secondSession.result.succeeded ||
+        secondSession.result.first("state") != "second" ||
+        reusableDescriptor < 0) 100
     else 0
 }
