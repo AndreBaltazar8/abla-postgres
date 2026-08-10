@@ -36,8 +36,9 @@ scalar descriptor/buffer state for Abla servers whose state is global.
 
 SCRAM nonces come from `/dev/urandom`. The client validates the server nonce
 prefix, Base64 salt, a bounded iteration count, and the final server signature.
-SHA-256, HMAC-SHA-256, PBKDF2, Base64, and proof XOR are implemented in Abla
-and covered by RFC and independent test vectors. MD5 uses PostgreSQL's nested
+SHA-256, HMAC-SHA-256, PBKDF2, Base64, and proof XOR come from the portable
+`abla/crypto` standard-library module and are covered by RFC and independent
+test vectors. MD5 uses PostgreSQL's nested
 `md5(md5(password + user) + salt)` challenge construction.
 
 ## Planned protocol work

@@ -5,6 +5,7 @@
 
 import "abla/sys/linux/net"
 import "abla/sys/linux/process"
+import "abla/bytes"
 import "crypto.ab"
 
 class PgConfig(
@@ -183,13 +184,14 @@ fun pgAppendCString(var bytes: array<int>, value: string): void {
 }
 
 fun pgBytes(bytes: array<int>): string {
-    val buffer = nativeByteBuffer(bytes.size + 1)
+    val buffer = byteBuffer()
     var index = 0
-    while (index < bytes.size) {
-        buffer.store(index, bytes[index])
+    var valid = true
+    while (valid && index < bytes.size) {
+        valid = buffer.appendByteValue(bytes[index])
         index = index + 1
     }
-    buffer.adoptString(bytes.size)
+    if (valid) buffer.toText() else ""
 }
 
 fun pgTypedMessage(kind: int, body: array<int>): string {
@@ -426,7 +428,7 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig): string {
                             val verifier = pgScramAttribute(outcome, 118)
                             if (serverError != "") {
                                 error = "PostgreSQL SCRAM authentication failed: $serverError"
-                            } else if (!pgConstantTimeEqual(
+                            } else if (!constantTimeEquals(
                                 verifier, expectedServerSignature
                             )) {
                                 error = "PostgreSQL SCRAM server proof verification failed"

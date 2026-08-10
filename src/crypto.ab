@@ -1,435 +1,14 @@
-// Minimal cryptographic building blocks required by PostgreSQL password
-// authentication. These operate on byte strings and fixed 32-bit words.
+// PostgreSQL-specific SCRAM and legacy MD5 authentication framing. General
+// cryptographic algorithms live in the Abla standard library.
 
-import "abla/bits"
+import "abla/crypto"
 import "abla/sys/linux"
-
-fun pgCryptoU32(value: int): int {
-    var result = value - value / 4294967296 * 4294967296
-    if (result < 0) result = result + 4294967296
-    result
-}
-
-fun pgCryptoXor(left: int, right: int): int =
-    bitAnd(bitXor(left, right), 4294967295)
-
-fun pgCryptoNot(value: int): int = bitAnd(bitNot(value), 4294967295)
-
-fun pgCryptoRotateRight(value: int, count: int): int = bitAnd(bitOr(
-    bitShiftRightUnsigned(value, count),
-    bitShiftLeft(value, 32 - count)
-), 4294967295)
-
-fun pgCryptoRotateLeft(value: int, count: int): int = bitAnd(bitOr(
-    bitShiftLeft(value, count),
-    bitShiftRightUnsigned(value, 32 - count)
-), 4294967295)
-
-fun pgCryptoBytes(bytes: array<int>): string {
-    val buffer = nativeByteBuffer(bytes.size + 1)
-    var index = 0
-    while (index < bytes.size) {
-        buffer.store(index, bytes[index])
-        index = index + 1
-    }
-    buffer.adoptString(bytes.size)
-}
-
-fun pgCryptoAppendText(var bytes: array<int>, value: string): void {
-    var index = 0
-    while (index < value.size) {
-        bytes.append(value[index])
-        index = index + 1
-    }
-}
-
-fun pgCryptoAppendU32Big(var bytes: array<int>, value: int): void {
-    bytes.append(bitAnd(bitShiftRightUnsigned(value, 24), 255))
-    bytes.append(bitAnd(bitShiftRightUnsigned(value, 16), 255))
-    bytes.append(bitAnd(bitShiftRightUnsigned(value, 8), 255))
-    bytes.append(bitAnd(value, 255))
-}
-
-fun pgCryptoAppendU32Little(var bytes: array<int>, value: int): void {
-    bytes.append(bitAnd(value, 255))
-    bytes.append(bitAnd(bitShiftRightUnsigned(value, 8), 255))
-    bytes.append(bitAnd(bitShiftRightUnsigned(value, 16), 255))
-    bytes.append(bitAnd(bitShiftRightUnsigned(value, 24), 255))
-}
-
-fun pgCryptoReadU32Big(bytes: array<int>, offset: int): int =
-    bytes[offset] * 16777216 + bytes[offset + 1] * 65536 +
-    bytes[offset + 2] * 256 + bytes[offset + 3]
-
-fun pgCryptoReadU32Little(bytes: array<int>, offset: int): int =
-    bytes[offset] + bytes[offset + 1] * 256 +
-    bytes[offset + 2] * 65536 + bytes[offset + 3] * 16777216
-
-fun pgCryptoSha256Constants(): array<int> = [
-    1116352408, 1899447441, 3049323471, 3921009573,
-    961987163, 1508970993, 2453635748, 2870763221,
-    3624381080, 310598401, 607225278, 1426881987,
-    1925078388, 2162078206, 2614888103, 3248222580,
-    3835390401, 4022224774, 264347078, 604807628,
-    770255983, 1249150122, 1555081692, 1996064986,
-    2554220882, 2821834349, 2952996808, 3210313671,
-    3336571891, 3584528711, 113926993, 338241895,
-    666307205, 773529912, 1294757372, 1396182291,
-    1695183700, 1986661051, 2177026350, 2456956037,
-    2730485921, 2820302411, 3259730800, 3345764771,
-    3516065817, 3600352804, 4094571909, 275423344,
-    430227734, 506948616, 659060556, 883997877,
-    958139571, 1322822218, 1537002063, 1747873779,
-    1955562222, 2024104815, 2227730452, 2361852424,
-    2428436474, 2756734187, 3204031479, 3329325298
-]
-
-fun pgSha256(value: string): string {
-    val input: array<int> = []
-    pgCryptoAppendText(input, value)
-    val bitLength = input.size * 8
-    input.append(128)
-    while (input.size - input.size / 64 * 64 != 56) input.append(0)
-    input.append(0)
-    input.append(0)
-    input.append(0)
-    input.append(0)
-    pgCryptoAppendU32Big(input, bitLength)
-
-    var h0 = 1779033703
-    var h1 = 3144134277
-    var h2 = 1013904242
-    var h3 = 2773480762
-    var h4 = 1359893119
-    var h5 = 2600822924
-    var h6 = 528734635
-    var h7 = 1541459225
-    val constants = pgCryptoSha256Constants()
-    var offset = 0
-    while (offset < input.size) {
-        val words: array<int> = []
-        var index = 0
-        while (index < 16) {
-            words.append(pgCryptoReadU32Big(input, offset + index * 4))
-            index = index + 1
-        }
-        while (index < 64) {
-            val previous15 = words[index - 15]
-            val previous2 = words[index - 2]
-            val small0 = pgCryptoXor(
-                pgCryptoXor(pgCryptoRotateRight(previous15, 7),
-                    pgCryptoRotateRight(previous15, 18)),
-                bitShiftRightUnsigned(previous15, 3)
-            )
-            val small1 = pgCryptoXor(
-                pgCryptoXor(pgCryptoRotateRight(previous2, 17),
-                    pgCryptoRotateRight(previous2, 19)),
-                bitShiftRightUnsigned(previous2, 10)
-            )
-            words.append(pgCryptoU32(
-                words[index - 16] + small0 + words[index - 7] + small1
-            ))
-            index = index + 1
-        }
-
-        var a = h0
-        var b = h1
-        var c = h2
-        var d = h3
-        var e = h4
-        var f = h5
-        var g = h6
-        var h = h7
-        index = 0
-        while (index < 64) {
-            val big1 = pgCryptoXor(
-                pgCryptoXor(pgCryptoRotateRight(e, 6),
-                    pgCryptoRotateRight(e, 11)),
-                pgCryptoRotateRight(e, 25)
-            )
-            val choose = pgCryptoXor(
-                bitAnd(e, f), bitAnd(pgCryptoNot(e), g)
-            )
-            val temporary1 = pgCryptoU32(
-                h + big1 + choose + constants[index] + words[index]
-            )
-            val big0 = pgCryptoXor(
-                pgCryptoXor(pgCryptoRotateRight(a, 2),
-                    pgCryptoRotateRight(a, 13)),
-                pgCryptoRotateRight(a, 22)
-            )
-            val majority = pgCryptoXor(
-                pgCryptoXor(bitAnd(a, b), bitAnd(a, c)), bitAnd(b, c)
-            )
-            val temporary2 = pgCryptoU32(big0 + majority)
-            h = g
-            g = f
-            f = e
-            e = pgCryptoU32(d + temporary1)
-            d = c
-            c = b
-            b = a
-            a = pgCryptoU32(temporary1 + temporary2)
-            index = index + 1
-        }
-        h0 = pgCryptoU32(h0 + a)
-        h1 = pgCryptoU32(h1 + b)
-        h2 = pgCryptoU32(h2 + c)
-        h3 = pgCryptoU32(h3 + d)
-        h4 = pgCryptoU32(h4 + e)
-        h5 = pgCryptoU32(h5 + f)
-        h6 = pgCryptoU32(h6 + g)
-        h7 = pgCryptoU32(h7 + h)
-        offset = offset + 64
-    }
-    val output: array<int> = []
-    pgCryptoAppendU32Big(output, h0)
-    pgCryptoAppendU32Big(output, h1)
-    pgCryptoAppendU32Big(output, h2)
-    pgCryptoAppendU32Big(output, h3)
-    pgCryptoAppendU32Big(output, h4)
-    pgCryptoAppendU32Big(output, h5)
-    pgCryptoAppendU32Big(output, h6)
-    pgCryptoAppendU32Big(output, h7)
-    pgCryptoBytes(output)
-}
-
-fun pgBinaryXor(left: string, right: string): string {
-    val output: array<int> = []
-    var index = 0
-    var count = left.size
-    if (right.size < count) count = right.size
-    while (index < count) {
-        output.append(bitAnd(bitXor(left[index], right[index]), 255))
-        index = index + 1
-    }
-    pgCryptoBytes(output)
-}
-
-fun pgHmacSha256(key: string, message: string): string {
-    var normalized = key
-    if (normalized.size > 64) normalized = pgSha256(normalized)
-    val inner: array<int> = []
-    val outer: array<int> = []
-    var index = 0
-    while (index < 64) {
-        val byte = if (index < normalized.size) normalized[index] else 0
-        inner.append(bitXor(byte, 54))
-        outer.append(bitXor(byte, 92))
-        index = index + 1
-    }
-    pgCryptoAppendText(inner, message)
-    pgCryptoAppendText(outer, pgSha256(pgCryptoBytes(inner)))
-    pgSha256(pgCryptoBytes(outer))
-}
-
-fun pgPbkdf2Sha256(password: string, salt: string, iterations: int): string {
-    var result = ""
-    if (iterations > 0 && iterations <= 1000000) {
-        val firstInput: array<int> = []
-        pgCryptoAppendText(firstInput, salt)
-        pgCryptoAppendU32Big(firstInput, 1)
-        var current = pgHmacSha256(password, pgCryptoBytes(firstInput))
-        result = current
-        var iteration = 1
-        while (iteration < iterations) {
-            current = pgHmacSha256(password, current)
-            result = pgBinaryXor(result, current)
-            iteration = iteration + 1
-        }
-    }
-    result
-}
-
-fun pgBase64Alphabet(): string =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-
-fun pgBase64Encode(value: string): string {
-    val alphabet = pgBase64Alphabet()
-    var output = ""
-    var index = 0
-    while (index < value.size) {
-        val first = value[index]
-        val second = if (index + 1 < value.size) value[index + 1] else 0
-        val third = if (index + 2 < value.size) value[index + 2] else 0
-        val combined = first * 65536 + second * 256 + third
-        val a = combined / 262144
-        val b = combined / 4096 - a * 64
-        val c = combined / 64 - combined / 4096 * 64
-        val d = combined - combined / 64 * 64
-        output = "$output${alphabet.slice(a, a + 1)}${alphabet.slice(b, b + 1)}"
-        if (index + 1 < value.size) output = "$output${alphabet.slice(c, c + 1)}"
-        else output = "${output}="
-        if (index + 2 < value.size) output = "$output${alphabet.slice(d, d + 1)}"
-        else output = "${output}="
-        index = index + 3
-    }
-    output
-}
-
-fun pgBase64Digit(value: int): int {
-    val alphabet = pgBase64Alphabet()
-    var result = -1
-    var index = 0
-    while (index < alphabet.size) {
-        if (alphabet[index] == value) result = index
-        index = index + 1
-    }
-    result
-}
-
-fun pgBase64Decode(value: string): string {
-    val output: array<int> = []
-    var valid = value.size > 0 && value.size - value.size / 4 * 4 == 0
-    var index = 0
-    while (valid && index < value.size) {
-        val a = pgBase64Digit(value[index])
-        val b = pgBase64Digit(value[index + 1])
-        val padded2 = value[index + 2] == 61
-        val padded3 = value[index + 3] == 61
-        val c = if (padded2) 0 else pgBase64Digit(value[index + 2])
-        val d = if (padded3) 0 else pgBase64Digit(value[index + 3])
-        if (a < 0 || b < 0 || c < 0 || d < 0 ||
-            (padded2 && !padded3) ||
-            ((padded2 || padded3) && index + 4 != value.size)) valid = false
-        else {
-            val combined = a * 262144 + b * 4096 + c * 64 + d
-            output.append(combined / 65536)
-            if (!padded2) output.append(combined / 256 - combined / 65536 * 256)
-            if (!padded3) output.append(combined - combined / 256 * 256)
-        }
-        index = index + 4
-    }
-    if (valid) pgCryptoBytes(output) else ""
-}
-
-fun pgHex(value: string): string {
-    val digits = "0123456789abcdef"
-    var output = ""
-    var index = 0
-    while (index < value.size) {
-        val byte = value[index]
-        val high = digits.slice(byte / 16, byte / 16 + 1)
-        val lowIndex = byte - byte / 16 * 16
-        val low = digits.slice(lowIndex, lowIndex + 1)
-        output = "$output$high$low"
-        index = index + 1
-    }
-    output
-}
-
-fun pgMd5Constants(): array<int> = [
-    3614090360, 3905402710, 606105819, 3250441966,
-    4118548399, 1200080426, 2821735955, 4249261313,
-    1770035416, 2336552879, 4294925233, 2304563134,
-    1804603682, 4254626195, 2792965006, 1236535329,
-    4129170786, 3225465664, 643717713, 3921069994,
-    3593408605, 38016083, 3634488961, 3889429448,
-    568446438, 3275163606, 4107603335, 1163531501,
-    2850285829, 4243563512, 1735328473, 2368359562,
-    4294588738, 2272392833, 1839030562, 4259657740,
-    2763975236, 1272893353, 4139469664, 3200236656,
-    681279174, 3936430074, 3572445317, 76029189,
-    3654602809, 3873151461, 530742520, 3299628645,
-    4096336452, 1126891415, 2878612391, 4237533241,
-    1700485571, 2399980690, 4293915773, 2240044497,
-    1873313359, 4264355552, 2734768916, 1309151649,
-    4149444226, 3174756917, 718787259, 3951481745
-]
-
-fun pgMd5Shifts(): array<int> = [
-    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
-    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
-]
-
-fun pgMd5(value: string): string {
-    val input: array<int> = []
-    pgCryptoAppendText(input, value)
-    val bitLength = input.size * 8
-    input.append(128)
-    while (input.size - input.size / 64 * 64 != 56) input.append(0)
-    pgCryptoAppendU32Little(input, bitLength)
-    input.append(0)
-    input.append(0)
-    input.append(0)
-    input.append(0)
-    var state0 = 1732584193
-    var state1 = 4023233417
-    var state2 = 2562383102
-    var state3 = 271733878
-    val constants = pgMd5Constants()
-    val shifts = pgMd5Shifts()
-    var offset = 0
-    while (offset < input.size) {
-        val words: array<int> = []
-        var index = 0
-        while (index < 16) {
-            words.append(pgCryptoReadU32Little(input, offset + index * 4))
-            index = index + 1
-        }
-        var a = state0
-        var b = state1
-        var c = state2
-        var d = state3
-        index = 0
-        while (index < 64) {
-            var mixed = 0
-            var word = 0
-            if (index < 16) {
-                mixed = bitOr(bitAnd(b, c), bitAnd(pgCryptoNot(b), d))
-                word = index
-            } else if (index < 32) {
-                mixed = bitOr(bitAnd(d, b), bitAnd(pgCryptoNot(d), c))
-                word = index * 5 + 1 - (index * 5 + 1) / 16 * 16
-            } else if (index < 48) {
-                mixed = pgCryptoXor(pgCryptoXor(b, c), d)
-                word = index * 3 + 5 - (index * 3 + 5) / 16 * 16
-            } else {
-                mixed = pgCryptoXor(c, bitOr(b, pgCryptoNot(d)))
-                word = index * 7 - index * 7 / 16 * 16
-            }
-            val nextD = d
-            d = c
-            c = b
-            b = pgCryptoU32(b + pgCryptoRotateLeft(pgCryptoU32(
-                a + mixed + constants[index] + words[word]
-            ), shifts[index]))
-            a = nextD
-            index = index + 1
-        }
-        state0 = pgCryptoU32(state0 + a)
-        state1 = pgCryptoU32(state1 + b)
-        state2 = pgCryptoU32(state2 + c)
-        state3 = pgCryptoU32(state3 + d)
-        offset = offset + 64
-    }
-    val output: array<int> = []
-    pgCryptoAppendU32Little(output, state0)
-    pgCryptoAppendU32Little(output, state1)
-    pgCryptoAppendU32Little(output, state2)
-    pgCryptoAppendU32Little(output, state3)
-    pgCryptoBytes(output)
-}
-
-fun pgConstantTimeEqual(left: string, right: string): bool {
-    var difference = bitXor(left.size, right.size)
-    var index = 0
-    var count = left.size
-    if (right.size < count) count = right.size
-    while (index < count) {
-        difference = bitOr(difference, bitXor(left[index], right[index]))
-        index = index + 1
-    }
-    difference == 0
-}
 
 fun pgSecureNonce(): string {
     val random = linuxReadFile("/dev/urandom", 18)
     var result = ""
     if (random.size == 18) {
-        val encoded = pgBase64Encode(random)
+        val encoded = base64Encode(random)
         var end = encoded.size
         while (end > 0 && encoded[end - 1] == 61) end = end - 1
         result = encoded.slice(0, end)
@@ -504,7 +83,7 @@ fun pgScramProof(
     val encodedSalt = pgScramAttribute(serverFirst, 115)
     val iterationText = pgScramAttribute(serverFirst, 105)
     val iterations = pgCryptoPositiveInt(iterationText)
-    val salt = pgBase64Decode(encodedSalt)
+    val salt = base64Decode(encodedSalt)
     if (pgScramAttribute(serverFirst, 109) != "") {
         error = "PostgreSQL SCRAM server requires an unsupported mandatory extension"
     } else if (clientNonce == "" || serverNonce.size <= clientNonce.size ||
@@ -520,16 +99,16 @@ fun pgScramProof(
     if (error == "") {
         val withoutProof = "c=biws,r=$serverNonce"
         val authMessage = "$clientFirstBare,$serverFirst,$withoutProof"
-        val saltedPassword = pgPbkdf2Sha256(password, salt, iterations)
-        val clientKey = pgHmacSha256(saltedPassword, "Client Key")
-        val storedKey = pgSha256(clientKey)
-        val clientSignature = pgHmacSha256(storedKey, authMessage)
-        val proof = pgBinaryXor(clientKey, clientSignature)
-        val serverKey = pgHmacSha256(saltedPassword, "Server Key")
-        serverSignature = pgBase64Encode(
-            pgHmacSha256(serverKey, authMessage)
+        val saltedPassword = pbkdf2Sha256(password, salt, iterations)
+        val clientKey = hmacSha256(saltedPassword, "Client Key")
+        val storedKey = sha256(clientKey)
+        val clientSignature = hmacSha256(storedKey, authMessage)
+        val proof = binaryXor(clientKey, clientSignature)
+        val serverKey = hmacSha256(saltedPassword, "Server Key")
+        serverSignature = base64Encode(
+            hmacSha256(serverKey, authMessage)
         )
-        clientFinal = "$withoutProof,p=${pgBase64Encode(proof)}"
+        clientFinal = "$withoutProof,p=${base64Encode(proof)}"
     }
     PgScramProof(clientFinal, serverSignature, error)
 }
@@ -541,8 +120,8 @@ fun pgMd5PasswordResponse(
 ): string {
     var result = ""
     if (salt.size == 4) {
-        val inner = pgHex(pgMd5("$password$user"))
-        result = "md5${pgHex(pgMd5("$inner$salt"))}"
+        val inner = hexEncode(md5("$password$user"))
+        result = "md5${hexEncode(md5("$inner$salt"))}"
     }
     result
 }

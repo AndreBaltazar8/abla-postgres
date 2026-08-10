@@ -1,4 +1,5 @@
 import "../src/postgres.ab"
+import "abla/io"
 
 fun main: int {
     val config = pgConfigFromEnvironment()
@@ -19,9 +20,16 @@ fun main: int {
     client.close()
     val afterReconnect = client.query("SELECT 'reconnected' AS state", [])
     client.close()
-    if (!created.succeeded) 10
-    else if (!written.succeeded) 20
-    else if (!selected.succeeded) 30
+    if (!created.succeeded) {
+        eprintln("create failed: ${created.error}")
+        10
+    } else if (!written.succeeded) {
+        eprintln("write failed: ${written.error}")
+        20
+    } else if (!selected.succeeded) {
+        eprintln("select failed: ${selected.error}")
+        30
+    }
     else if (selected.rows.size != 1) 40
     else if (selected.first("value") != "O'Reilly from Abla") 50
     else if (!selected.rows[0][1].isNull) 60

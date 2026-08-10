@@ -15,7 +15,7 @@ The current release includes:
 - PostgreSQL server error propagation;
 - trust, cleartext password, MD5 challenge-response, and SCRAM-SHA-256
   authentication;
-- RFC-compatible SHA-256/HMAC/PBKDF2 proofs with server-signature
+- RFC-compatible SHA-256/HMAC/PBKDF2 proofs from `abla/crypto`, with server-signature
   verification;
 - environment-based configuration; and
 - numeric IPv4 plus Docker/Icy service-name resolution.

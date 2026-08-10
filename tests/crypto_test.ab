@@ -1,7 +1,8 @@
 import "../src/crypto.ab"
+import "abla/crypto"
 
 fun main: int {
-    val hmac = pgHmacSha256(
+    val hmac = hmacSha256(
         "key",
         "The quick brown fox jumps over the lazy dog"
     )
@@ -10,22 +11,22 @@ fun main: int {
         "n=user,r=rOprNGfwEbeRWgbNEkqO",
         "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF\$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
     )
-    if (pgHex(pgSha256("")) !=
+    if (hexEncode(sha256("")) !=
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") 10
-    else if (pgHex(pgSha256("abc")) !=
+    else if (hexEncode(sha256("abc")) !=
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") 20
-    else if (pgHex(hmac) !=
+    else if (hexEncode(hmac) !=
         "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8") 30
-    else if (pgHex(pgPbkdf2Sha256("password", "salt", 1)) !=
+    else if (hexEncode(pbkdf2Sha256("password", "salt", 1)) !=
         "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b") 40
-    else if (pgHex(pgPbkdf2Sha256("password", "salt", 2)) !=
+    else if (hexEncode(pbkdf2Sha256("password", "salt", 2)) !=
         "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43") 50
-    else if (pgBase64Encode("hello") != "aGVsbG8=") 60
-    else if (pgBase64Decode("aGVsbG8=") != "hello") 70
-    else if (pgHex(pgMd5("")) != "d41d8cd98f00b204e9800998ecf8427e") 80
-    else if (pgHex(pgMd5("abc")) != "900150983cd24fb0d6963f7d28e17f72") 90
-    else if (!pgConstantTimeEqual("same", "same")) 100
-    else if (pgConstantTimeEqual("same", "different")) 110
+    else if (base64Encode("hello") != "aGVsbG8=") 60
+    else if (base64Decode("aGVsbG8=") != "hello") 70
+    else if (hexEncode(md5("")) != "d41d8cd98f00b204e9800998ecf8427e") 80
+    else if (hexEncode(md5("abc")) != "900150983cd24fb0d6963f7d28e17f72") 90
+    else if (!constantTimeEquals("same", "same")) 100
+    else if (constantTimeEquals("same", "different")) 110
     else if (pgSecureNonce().size < 20) 120
     else if (pgSaslName("a,b=c") != "a=2Cb=3Dc") 130
     else if (pgMd5PasswordResponse("user", "password", "1234") !=
