@@ -1,0 +1,109 @@
+import "../src/async.ab"
+import "abla/io"
+
+// Requires a PostgreSQL server; configure with POSTGRES_HOST/PORT/DB/USER/
+// PASSWORD (tools/test-postgres.sh provides one).
+
+var asyncFailures = 0
+
+fun asyncCheck(name: string, ok: bool): void {
+    if (!ok) {
+        println("FAIL $name")
+        asyncFailures = asyncFailures + 1
+    }
+    return
+}
+
+// Drives the pool until `count` results arrive and returns them.
+fun asyncDrain(var pool: PgPool, count: int): array<PgAsyncResult> {
+    val collected: array<PgAsyncResult> = []
+    var loops = 0
+    while (collected.size < count && loops < 2000) {
+        pool.step(10)
+        val results = pool.takeResults()
+        var index = 0
+        while (index < results.size) {
+            collected.append(results[index])
+            index = index + 1
+        }
+        loops = loops + 1
+    }
+    collected
+}
+
+fun asyncFind(results: array<PgAsyncResult>, id: int): PgResult {
+    var found = PgResult(false, [], [], "", "missing result")
+    var index = 0
+    while (index < results.size) {
+        if (results[index].id == id) found = results[index].result
+        index = index + 1
+    }
+    found
+}
+
+fun main: int {
+    val config = pgConfigFromEnvironment()
+    val pool = pgPool(config, PgPoolOptions(size = 4))
+
+    // Concurrency over a capped pool.
+    val ids: array<int> = []
+    var index = 0
+    while (index < 20) {
+        ids.append(pool.query("SELECT (\$1::int * 2)::text AS doubled", [pgText("$index")]))
+        index = index + 1
+    }
+    val setup = pool.execute("CREATE TABLE IF NOT EXISTS abla_async (id int PRIMARY KEY, v text)")
+    val broken = pool.query("SELECT abla_missing_column")
+    val first = asyncDrain(pool, 22)
+    asyncCheck("first wave count", first.size == 22)
+    index = 0
+    var doubled = 0
+    while (index < 20) {
+        if (asyncFind(first, ids[index]).first("doubled") == "${index * 2}") doubled = doubled + 1
+        index = index + 1
+    }
+    asyncCheck("doubled", doubled == 20)
+    asyncCheck("setup", asyncFind(first, setup).succeeded)
+    val error = asyncFind(first, broken)
+    asyncCheck("error", !error.succeeded &&
+        textFindSequence(error.error, "abla_missing_column", 0, error.error.size) >= 0)
+    asyncCheck("pool cap", pool.connectionCount() <= 4)
+
+    // Commit, rollback, and an aborted transaction.
+    pool.execute("DELETE FROM abla_async")
+    asyncDrain(pool, 1)
+    val committed = pool.begin()
+    pool.execute("INSERT INTO abla_async VALUES (1, 'kept')", [], committed)
+    val locked = pool.query("SELECT v FROM abla_async WHERE id = 1 FOR UPDATE", [], committed)
+    val commit = pool.commit(committed)
+    val discarded = pool.begin()
+    pool.execute("INSERT INTO abla_async VALUES (2, 'gone')", [], discarded)
+    val rollback = pool.rollback(discarded)
+    val aborted = pool.begin()
+    pool.execute("INSERT INTO abla_async VALUES (3, 'x')", [], aborted)
+    val duplicate = pool.execute("INSERT INTO abla_async VALUES (3, 'y')", [], aborted)
+    val afterAbort = pool.query("SELECT 1", [], aborted)
+    val abortRollback = pool.rollback(aborted)
+    val txResults = asyncDrain(pool, 12)
+    asyncCheck("tx results", txResults.size == 12)
+    asyncCheck("locked read", asyncFind(txResults, locked).first("v") == "kept")
+    asyncCheck("commit", asyncFind(txResults, commit).succeeded)
+    asyncCheck("rollback", asyncFind(txResults, rollback).succeeded)
+    asyncCheck("duplicate fails", !asyncFind(txResults, duplicate).succeeded)
+    asyncCheck("aborted tx refuses", !asyncFind(txResults, afterAbort).succeeded)
+    asyncCheck("abort rollback", asyncFind(txResults, abortRollback).succeeded)
+    val check = pool.query("SELECT string_agg(v, ',' ORDER BY id) AS vs FROM abla_async")
+    val checked = asyncDrain(pool, 1)
+    asyncCheck("visible rows", asyncFind(checked, check).first("vs") == "kept")
+    val stale = pool.query("SELECT 1", [], committed)
+    asyncCheck("finished tx", !asyncFind(asyncDrain(pool, 1), stale).succeeded)
+
+    // Wrong password: queued work fails instead of hanging.
+    val wrong = pgPool(PgConfig(config.host, config.port, config.database, config.user, "nope"))
+    val denied = wrong.query("SELECT 1")
+    val deniedResults = asyncDrain(wrong, 1)
+    asyncCheck("auth failure", deniedResults.size == 1 && !asyncFind(deniedResults, denied).succeeded)
+    asyncCheck("drained", pool.pending() == 0)
+
+    if (asyncFailures == 0) 42 else 1
+}

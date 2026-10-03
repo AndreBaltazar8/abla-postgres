@@ -1,0 +1,833 @@
+// Event-loop PostgreSQL pool. Queries are queued and progress only inside
+// `step`, so a single-threaded service (for example a fixed-tick game server)
+// never blocks on the database:
+//
+//     val db = pgPool(pgConfigFromUrl(databaseUrl), PgPoolOptions(size = 8))
+//     server.watchExternal(db.pollDescriptor())     // wake on replies
+//     val read = db.query("SELECT xp FROM player WHERE id = \$1", [pgText(id)])
+//     val tx = db.begin()
+//     db.query("SELECT ... FOR UPDATE", [], tx)      // pinned to tx's connection
+//     db.query("UPDATE ...", [...], tx)
+//     db.commit(tx)
+//     ... each loop iteration:
+//     db.step(0)
+//     val results = db.takeResults()                 // PgAsyncResult(id, result, ...)
+//
+// Connections authenticate (trust, cleartext, MD5, SCRAM-SHA-256 with server
+// proof verification) through a nonblocking state machine. Each connection
+// runs one extended-protocol statement at a time. A transaction pins one
+// connection from BEGIN until COMMIT/ROLLBACK finishes; its statements run
+// in issue order. Host names resolve once per connection attempt through
+// `abla/dns`; numeric addresses skip resolution.
+
+import "postgres.ab"
+import "abla/dns"
+import "abla/text"
+
+class PgPoolOptions(
+    val size: int = 8,
+    val queryTimeoutMilliseconds: int = 15000,
+    val connectTimeoutMilliseconds: int = 5000
+)
+
+class PgAsyncResult(
+    val id: int,
+    val transaction: int,
+    val result: PgResult,
+    val elapsedMilliseconds: int
+)
+
+class PgAsyncRead(var text: string, var status: int)
+
+// Connection states.
+val pgAsyncFree = 0
+val pgAsyncConnecting = 1
+val pgAsyncAuthenticating = 2
+val pgAsyncIdle = 3
+val pgAsyncBusy = 4
+
+// Operation kinds.
+val pgAsyncQueryOp = 0
+val pgAsyncBeginOp = 1
+val pgAsyncEndOp = 2
+
+resource class PgPool(
+    val config: PgConfig,
+    val options: PgPoolOptions,
+    val poller: SocketPoller,
+    val reader: PgAsyncRead,
+    var address: string,
+    // operations
+    val opIds: array<int>,
+    val opStates: array<int>,
+    val opKinds: array<int>,
+    val opTransactions: array<int>,
+    val opPayloads: array<string>,
+    val opDeadlines: array<int>,
+    val opStarted: array<int>,
+    // connections
+    val connDescriptors: array<int>,
+    val connStates: array<int>,
+    val connInputs: array<string>,
+    val connOutputs: array<string>,
+    val connOutputOffsets: array<int>,
+    val connOps: array<int>,
+    val connTransactions: array<int>,
+    val connDeadlines: array<int>,
+    val connWriteInterest: array<bool>,
+    val connClientFirst: array<string>,
+    val connServerSignature: array<string>,
+    val connScramVerified: array<bool>,
+    val connPasswordSent: array<bool>,
+    val connAuthenticated: array<bool>,
+    val connColumns: array<array<string>>,
+    val connRows: array<array<array<PgValue>>>,
+    val connCommands: array<string>,
+    val connErrors: array<string>,
+    val routes: array<int>,
+    // transactions: id -> pinned connection (-1 before BEGIN runs)
+    val txIds: array<int>,
+    val txConnections: array<int>,
+    val txFailed: array<string>,
+    var results: array<PgAsyncResult>,
+    var nextId: int,
+    var pendingOps: int,
+    var lastConnectError: string
+) {
+    fun drop(): void {
+        var slot = 0
+        while (slot < this.connStates.size) {
+            if (this.connDescriptors[slot] >= 0) {
+                linuxTcpCloseDescriptor(this.connDescriptors[slot])
+                this.connDescriptors[slot] = -1
+            }
+            slot = slot + 1
+        }
+        this.poller.close()
+        return
+    }
+}
+
+fun pgPool(config: PgConfig, options: PgPoolOptions = PgPoolOptions()): PgPool =
+    PgPool(
+        config, options, socketPoller(), PgAsyncRead("", 0), "",
+        [], [], [], [], [], [], [],
+        [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [],
+        [], [],
+        [], [], [], [], 1, 0, ""
+    )
+
+// postgres://user:password@host:port/database (percent-encoded parts allowed).
+fun pgConfigFromUrl(url: string): PgConfig {
+    var rest = url
+    if (textFindSequence(url, "postgres://", 0, url.size) == 0) rest = url.slice(11, url.size)
+    else if (textFindSequence(url, "postgresql://", 0, url.size) == 0) {
+        rest = url.slice(13, url.size)
+    }
+    var user = "postgres"
+    var password = ""
+    val at = textFindByte(rest, 64, 0, rest.size)
+    if (at >= 0) {
+        val credentials = rest.slice(0, at)
+        rest = rest.slice(at + 1, rest.size)
+        val colon = textFindByte(credentials, 58, 0, credentials.size)
+        if (colon >= 0) {
+            user = pgAsyncPercentDecode(credentials.slice(0, colon))
+            password = pgAsyncPercentDecode(credentials.slice(colon + 1, credentials.size))
+        } else user = pgAsyncPercentDecode(credentials)
+    }
+    var slash = textFindByte(rest, 47, 0, rest.size)
+    if (slash < 0) slash = rest.size
+    val hostPort = rest.slice(0, slash)
+    var database = if (slash < rest.size) rest.slice(slash + 1, rest.size) else ""
+    val question = textFindByte(database, 63, 0, database.size)
+    if (question >= 0) database = database.slice(0, question)
+    var host = hostPort
+    var port = 5432
+    val colon = textFindByte(hostPort, 58, 0, hostPort.size)
+    if (colon >= 0) {
+        host = hostPort.slice(0, colon)
+        port = pgParsePositiveInt(hostPort.slice(colon + 1, hostPort.size), 5432)
+    }
+    if (host == "") host = "127.0.0.1"
+    if (database == "") database = user
+    PgConfig(host, port, pgAsyncPercentDecode(database), user, password)
+}
+
+fun pgAsyncHex(byte: int): int {
+    if (byte >= 48 && byte <= 57) byte - 48
+    else if (byte >= 65 && byte <= 70) byte - 55
+    else if (byte >= 97 && byte <= 102) byte - 87
+    else -1
+}
+
+fun pgAsyncPercentDecode(value: string): string {
+    if (textFindByte(value, 37, 0, value.size) < 0) return value
+    val output = byteBuffer()
+    var index = 0
+    while (index < value.size) {
+        if (value[index] == 37 && index + 2 < value.size + 0 &&
+            pgAsyncHex(value[index + 1]) >= 0 && pgAsyncHex(value[index + 2]) >= 0) {
+            output.appendByteValue(pgAsyncHex(value[index + 1]) * 16 + pgAsyncHex(value[index + 2]))
+            index = index + 3
+        } else {
+            output.appendByteValue(value[index])
+            index = index + 1
+        }
+    }
+    output.toText()
+}
+
+// ---------------------------------------------------------------------------
+// Native helpers
+
+fun pgAsyncConnect(address: string, port: int): int {
+    val octets = linuxIpv4Octets(address)
+    if (octets.size != 4) return -22
+    val descriptor = linuxSyscall3(41, 2, 526337, 0)
+    if (descriptor < 0) return descriptor
+    val socketAddress = nativeByteBuffer(16)
+    linuxNetStoreU16(socketAddress, 0, 2)
+    socketAddress.store(2, port / 256)
+    socketAddress.store(3, port - port / 256 * 256)
+    var octet = 0
+    while (octet < 4) {
+        socketAddress.store(4 + octet, octets[octet])
+        octet = octet + 1
+    }
+    var connected = linuxSyscall3(
+        42, descriptor, nativePointerAddress(socketAddress.address), 16
+    )
+    while (connected == -4) connected = linuxSyscall3(
+        42, descriptor, nativePointerAddress(socketAddress.address), 16
+    )
+    socketAddress.close()
+    if (connected == 0 || connected == -115) {
+        val enabled = nativeByteBuffer(8)
+        linuxNetStoreU32(enabled, 0, 1)
+        linuxSyscall5(54, descriptor, 6, 1, nativePointerAddress(enabled.address), 4)
+        enabled.close()
+        descriptor
+    } else {
+        linuxTcpCloseDescriptor(descriptor)
+        connected
+    }
+}
+
+fun pgAsyncSocketError(descriptor: int): int {
+    val error = nativeByteBuffer(8)
+    val errorLength = nativeByteBuffer(8)
+    linuxNetStoreU32(error, 0, 0)
+    linuxNetStoreU32(errorLength, 0, 4)
+    val inspected = linuxSyscall5(
+        55, descriptor, 1, 4,
+        nativePointerAddress(error.address), nativePointerAddress(errorLength.address)
+    )
+    val result = if (inspected == 0) linuxNetReadNativeU32(error, 0) else -inspected
+    error.close()
+    errorLength.close()
+    result
+}
+
+trusted fun pgAsyncReceive(descriptor: int, var result: PgAsyncRead): void {
+    val stack = nativeStackAllocate(65536)
+    var measured = linuxSyscall3(0, descriptor, stack, 65536)
+    while (measured == -4) measured = linuxSyscall3(0, descriptor, stack, 65536)
+    result.status = measured
+    if (measured > 0) {
+        val target = nativeByteBuffer(measured + 1)
+        ablaUnsafeCopyMemory(nativePointerAddress(target.address), stack, measured)
+        result.text = target.adoptString(measured)
+    } else result.text = ""
+    return
+}
+
+fun pgAsyncResolve(host: string): string {
+    val numeric = linuxIpv4Octets(host)
+    if (numeric.size == 4) return host
+    if (host == "localhost") return "127.0.0.1"
+    val resolution = dnsResolveType(host, 1, 2000)
+    var address = ""
+    var index = 0
+    while (address == "" && index < resolution.addresses.size) {
+        if (resolution.addresses[index].family == 4) address = resolution.addresses[index].address
+        index = index + 1
+    }
+    address
+}
+
+// ---------------------------------------------------------------------------
+// Bookkeeping
+
+fun PgPool.route(descriptor: int, slot: int): void {
+    while (this.routes.size <= descriptor) this.routes.append(-1)
+    this.routes[descriptor] = slot
+    return
+}
+
+fun PgPool.transactionIndex(id: int): int {
+    var found = -1
+    var index = 0
+    while (found < 0 && index < this.txIds.size) {
+        if (this.txIds[index] == id) found = index
+        index = index + 1
+    }
+    found
+}
+
+fun PgPool.finishOp(op: int, result: PgResult): void {
+    if (op >= 0 && this.opStates[op] != 0) {
+        this.results.append(PgAsyncResult(
+            this.opIds[op], this.opTransactions[op], result,
+            linuxMonotonicMilliseconds() - this.opStarted[op]
+        ))
+        this.opStates[op] = 0
+        this.opPayloads[op] = ""
+        this.pendingOps = this.pendingOps - 1
+        // Ending a transaction (successfully or not) releases its pin.
+        val tx = this.opTransactions[op]
+        if (tx != 0 && this.opKinds[op] == pgAsyncEndOp) {
+            val index = this.transactionIndex(tx)
+            if (index >= 0) {
+                val slot = this.txConnections[index]
+                if (slot >= 0 && slot < this.connStates.size &&
+                    this.connTransactions[slot] == tx) this.connTransactions[slot] = 0
+                this.txIds[index] = 0
+                this.txConnections[index] = -1
+            }
+        }
+    }
+    return
+}
+
+fun PgPool.failOp(op: int, error: string): void =
+    this.finishOp(op, PgResult(false, [], [], "", error))
+
+// Fails every queued operation of a transaction whose connection died.
+fun PgPool.failTransaction(tx: int, error: string): void {
+    var op = 0
+    while (op < this.opStates.size) {
+        if (this.opStates[op] != 0 && this.opTransactions[op] == tx) this.failOp(op, error)
+        op = op + 1
+    }
+    val index = this.transactionIndex(tx)
+    if (index >= 0) {
+        this.txIds[index] = 0
+        this.txConnections[index] = -1
+    }
+    return
+}
+
+fun PgPool.closeConnection(slot: int, error: string): void {
+    if (slot < 0 || this.connStates[slot] == pgAsyncFree) return
+    val descriptor = this.connDescriptors[slot]
+    if (descriptor >= 0) {
+        this.poller.unwatchDescriptor(descriptor)
+        if (descriptor < this.routes.size) this.routes[descriptor] = -1
+        linuxTcpCloseDescriptor(descriptor)
+        this.connDescriptors[slot] = -1
+    }
+    this.connStates[slot] = pgAsyncFree
+    val op = this.connOps[slot]
+    this.connOps[slot] = -1
+    if (op >= 0) this.failOp(op, error)
+    val tx = this.connTransactions[slot]
+    this.connTransactions[slot] = 0
+    if (tx != 0) this.failTransaction(tx, "transaction connection lost: $error")
+    this.connInputs[slot] = ""
+    this.connOutputs[slot] = ""
+    return
+}
+
+fun PgPool.interest(slot: int, write: bool): void {
+    if (this.connWriteInterest[slot] != write) {
+        this.poller.modifyDescriptor(this.connDescriptors[slot], true, write)
+        this.connWriteInterest[slot] = write
+    }
+    return
+}
+
+fun PgPool.queueOutput(slot: int, bytes: string): void {
+    this.connOutputs[slot] = if (this.connOutputOffsets[slot] >= this.connOutputs[slot].size)
+        bytes else "${this.connOutputs[slot].slice(this.connOutputOffsets[slot], this.connOutputs[slot].size)}$bytes"
+    this.connOutputOffsets[slot] = 0
+    this.writeReady(slot)
+    return
+}
+
+fun PgPool.writeReady(slot: int): void {
+    if (this.connStates[slot] == pgAsyncFree) return
+    val offset = this.connOutputOffsets[slot]
+    val output = this.connOutputs[slot]
+    if (offset >= output.size) {
+        this.interest(slot, false)
+        return
+    }
+    var connection = TcpConnection(this.connDescriptors[slot])
+    val result = connection.writeCompact(output, offset)
+    connection.descriptor = -1
+    if (result.written > 0) this.connOutputOffsets[slot] = offset + result.written
+    if (result.status == "error" && result.errorCode != 11) {
+        this.closeConnection(slot, "PostgreSQL write failed")
+    } else if (this.connOutputOffsets[slot] >= output.size) {
+        this.connOutputs[slot] = ""
+        this.connOutputOffsets[slot] = 0
+        this.interest(slot, false)
+    } else this.interest(slot, true)
+    return
+}
+
+fun PgPool.openConnection(): int {
+    if (this.address == "") this.address = pgAsyncResolve(this.config.host)
+    if (this.address == "") {
+        this.lastConnectError = "Could not resolve PostgreSQL host ${this.config.host}"
+        return -1
+    }
+    val descriptor = pgAsyncConnect(this.address, this.config.port)
+    if (descriptor < 0) {
+        this.lastConnectError = "Could not connect to PostgreSQL (errno ${-descriptor})"
+        this.address = ""
+        return -1
+    }
+    var slot = -1
+    var index = 0
+    while (slot < 0 && index < this.connStates.size) {
+        if (this.connStates[index] == pgAsyncFree) slot = index
+        index = index + 1
+    }
+    if (slot < 0) {
+        slot = this.connStates.size
+        this.connDescriptors.append(-1)
+        this.connStates.append(0)
+        this.connInputs.append("")
+        this.connOutputs.append("")
+        this.connOutputOffsets.append(0)
+        this.connOps.append(-1)
+        this.connTransactions.append(0)
+        this.connDeadlines.append(0)
+        this.connWriteInterest.append(false)
+        this.connClientFirst.append("")
+        this.connServerSignature.append("")
+        this.connScramVerified.append(false)
+        this.connPasswordSent.append(false)
+        this.connAuthenticated.append(false)
+        this.connColumns.append([])
+        this.connRows.append([])
+        this.connCommands.append("")
+        this.connErrors.append("")
+    }
+    this.connDescriptors[slot] = descriptor
+    this.connStates[slot] = pgAsyncConnecting
+    this.connInputs[slot] = ""
+    this.connOutputs[slot] = ""
+    this.connOutputOffsets[slot] = 0
+    this.connOps[slot] = -1
+    this.connTransactions[slot] = 0
+    this.connDeadlines[slot] = linuxMonotonicMilliseconds() +
+        this.options.connectTimeoutMilliseconds
+    this.connClientFirst[slot] = ""
+    this.connServerSignature[slot] = ""
+    this.connScramVerified[slot] = false
+    this.connPasswordSent[slot] = false
+    this.connAuthenticated[slot] = false
+    this.route(descriptor, slot)
+    this.poller.watchDescriptor(descriptor, true, true)
+    this.connWriteInterest[slot] = true
+    slot
+}
+
+// ---------------------------------------------------------------------------
+// Protocol
+
+fun PgPool.handleAuthentication(slot: int, kind: int, body: string): void {
+    if (kind == 69) {
+        this.lastConnectError = pgErrorMessage(body)
+        this.closeConnection(slot, this.lastConnectError)
+    } else if (kind == 82) {
+        if (body.size < 4) {
+            this.closeConnection(slot, "PostgreSQL sent a malformed authentication message")
+            return
+        }
+        val method = pgReadU32(body, 0)
+        if (method == 0) {
+            if (this.connClientFirst[slot] != "" && !this.connScramVerified[slot]) {
+                this.closeConnection(slot, "PostgreSQL completed SCRAM without a verified server proof")
+            } else this.connAuthenticated[slot] = true
+        } else if (method == 3 && !this.connPasswordSent[slot]) {
+            this.connPasswordSent[slot] = true
+            this.queueOutput(slot, pgPasswordMessage(this.config.password))
+        } else if (method == 5 && !this.connPasswordSent[slot] && body.size == 8) {
+            this.connPasswordSent[slot] = true
+            this.queueOutput(slot, pgPasswordMessage(pgMd5PasswordResponse(
+                this.config.user, this.config.password, body.slice(4, 8)
+            )))
+        } else if (method == 10 && this.connClientFirst[slot] == "" &&
+            pgAuthenticationOffers(body, "SCRAM-SHA-256")) {
+            val nonce = pgSecureNonce()
+            if (nonce == "") {
+                this.closeConnection(slot, "Could not generate a secure PostgreSQL SCRAM nonce")
+                return
+            }
+            this.connClientFirst[slot] = "n=${pgSaslName(this.config.user)},r=$nonce"
+            this.queueOutput(slot, pgSaslInitialMessage("n,,${this.connClientFirst[slot]}"))
+        } else if (method == 11 && this.connClientFirst[slot] != "" &&
+            this.connServerSignature[slot] == "") {
+            val proof = pgScramProof(
+                this.config.password, this.connClientFirst[slot], body.slice(4, body.size)
+            )
+            if (proof.error != "") this.closeConnection(slot, proof.error)
+            else {
+                this.connServerSignature[slot] = proof.serverSignature
+                this.queueOutput(slot, pgSaslResponseMessage(proof.clientFinal))
+            }
+        } else if (method == 12 && this.connServerSignature[slot] != "") {
+            val outcome = body.slice(4, body.size)
+            val serverError = pgScramAttribute(outcome, 101)
+            if (serverError != "") {
+                this.closeConnection(slot, "PostgreSQL SCRAM authentication failed: $serverError")
+            } else if (!constantTimeEquals(
+                pgScramAttribute(outcome, 118), this.connServerSignature[slot]
+            )) this.closeConnection(slot, "PostgreSQL SCRAM server proof verification failed")
+            else this.connScramVerified[slot] = true
+        } else {
+            this.closeConnection(slot, "PostgreSQL authentication method $method is not supported")
+        }
+    } else if (kind == 90) {
+        if (!this.connAuthenticated[slot]) {
+            this.closeConnection(slot, "PostgreSQL became ready before authentication completed")
+        } else {
+            this.connStates[slot] = pgAsyncIdle
+            this.lastConnectError = ""
+        }
+    }
+    return
+}
+
+fun PgPool.handleQueryMessage(slot: int, kind: int, body: string): void {
+    if (kind == 69) {
+        if (this.connErrors[slot] == "") this.connErrors[slot] = pgErrorMessage(body)
+    } else if (kind == 84 && this.connErrors[slot] == "") {
+        this.connColumns[slot] = pgParseColumns(body)
+    } else if (kind == 68 && this.connErrors[slot] == "") {
+        this.connRows[slot].append(pgParseRow(body))
+    } else if (kind == 67 && body.size > 0 && this.connErrors[slot] == "") {
+        this.connCommands[slot] = body.slice(0, body.size - 1)
+    } else if (kind == 90) {
+        val op = this.connOps[slot]
+        this.connOps[slot] = -1
+        this.connStates[slot] = pgAsyncIdle
+        val error = this.connErrors[slot]
+        val result = PgResult(
+            error == "", this.connColumns[slot], this.connRows[slot],
+            this.connCommands[slot], error
+        )
+        this.connColumns[slot] = []
+        this.connRows[slot] = []
+        this.connCommands[slot] = ""
+        this.connErrors[slot] = ""
+        // A failed BEGIN never pinned anything server-side.
+        if (op >= 0 && this.opKinds[op] == pgAsyncBeginOp && error != "") {
+            val tx = this.opTransactions[op]
+            this.connTransactions[slot] = 0
+            this.finishOp(op, result)
+            this.failTransaction(tx, "transaction could not begin: $error")
+        } else this.finishOp(op, result)
+    }
+    return
+}
+
+fun PgPool.readReady(slot: int): void {
+    pgAsyncReceive(this.connDescriptors[slot], this.reader)
+    val status = this.reader.status
+    val chunk = this.reader.text
+    this.reader.text = ""
+    if (status > 0) {
+        var input = if (this.connInputs[slot] == "") chunk else "${this.connInputs[slot]}$chunk"
+        var offset = 0
+        var parsing = true
+        while (parsing && this.connStates[slot] != pgAsyncFree) {
+            if (input.size - offset < 5) parsing = false
+            else {
+                val total = 1 + pgReadU32(input, offset + 1)
+                if (total < 5 || total > 16777216) {
+                    this.closeConnection(slot, "PostgreSQL sent an invalid message length")
+                    parsing = false
+                } else if (input.size - offset < total) parsing = false
+                else {
+                    val kind = input[offset]
+                    val body = input.slice(offset + 5, offset + total)
+                    offset = offset + total
+                    if (this.connStates[slot] == pgAsyncAuthenticating) {
+                        this.handleAuthentication(slot, kind, body)
+                    } else if (this.connStates[slot] == pgAsyncBusy) {
+                        this.handleQueryMessage(slot, kind, body)
+                    }
+                    // Notices, parameter status, and backend keys are ignored.
+                }
+            }
+        }
+        if (this.connStates[slot] != pgAsyncFree) {
+            this.connInputs[slot] = if (offset >= input.size) "" else input.slice(offset, input.size)
+        }
+    } else if (status != -11) {
+        this.closeConnection(slot, "PostgreSQL connection closed")
+    }
+    return
+}
+
+fun PgPool.socketReady(slot: int, readable: bool, writable: bool, failed: bool): void {
+    if (this.connStates[slot] == pgAsyncConnecting) {
+        if (writable || failed) {
+            val error = pgAsyncSocketError(this.connDescriptors[slot])
+            if (error != 0) {
+                this.lastConnectError = "Could not connect to PostgreSQL (errno $error)"
+                this.address = ""
+                this.closeConnection(slot, this.lastConnectError)
+            } else {
+                this.connStates[slot] = pgAsyncAuthenticating
+                this.interest(slot, false)
+                this.queueOutput(slot, pgBytes(pgStartup(this.config)))
+            }
+        }
+        return
+    }
+    if (writable) this.writeReady(slot)
+    if ((readable || failed) && this.connStates[slot] != pgAsyncFree) this.readReady(slot)
+    return
+}
+
+// ---------------------------------------------------------------------------
+// Scheduling
+
+fun PgPool.startOp(slot: int, op: int): void {
+    this.opStates[op] = 2
+    this.connOps[slot] = op
+    this.connStates[slot] = pgAsyncBusy
+    this.connColumns[slot] = []
+    this.connRows[slot] = []
+    this.connCommands[slot] = ""
+    this.connErrors[slot] = ""
+    this.queueOutput(slot, this.opPayloads[op])
+    return
+}
+
+fun PgPool.liveConnections(): int {
+    var count = 0
+    var slot = 0
+    while (slot < this.connStates.size) {
+        if (this.connStates[slot] != pgAsyncFree) count = count + 1
+        slot = slot + 1
+    }
+    count
+}
+
+fun PgPool.dispatch(): void {
+    var needed = 0
+    var op = 0
+    while (op < this.opStates.size) {
+        if (this.opStates[op] == 1) {
+            val tx = this.opTransactions[op]
+            var target = -1
+            if (tx != 0 && this.opKinds[op] != pgAsyncBeginOp) {
+                val index = this.transactionIndex(tx)
+                val pinned = if (index >= 0) this.txConnections[index] else -1
+                if (pinned >= 0 && this.connStates[pinned] == pgAsyncIdle) target = pinned
+            } else {
+                var slot = 0
+                while (target < 0 && slot < this.connStates.size) {
+                    if (this.connStates[slot] == pgAsyncIdle && this.connTransactions[slot] == 0) {
+                        target = slot
+                    }
+                    slot = slot + 1
+                }
+                if (target < 0) needed = needed + 1
+            }
+            if (target >= 0) {
+                if (this.opKinds[op] == pgAsyncBeginOp) {
+                    this.connTransactions[target] = tx
+                    val index = this.transactionIndex(tx)
+                    if (index >= 0) this.txConnections[index] = target
+                }
+                this.startOp(target, op)
+            }
+        }
+        op = op + 1
+    }
+    var opening = 0
+    var slot = 0
+    while (slot < this.connStates.size) {
+        if (this.connStates[slot] == pgAsyncConnecting ||
+            this.connStates[slot] == pgAsyncAuthenticating) opening = opening + 1
+        slot = slot + 1
+    }
+    var live = this.liveConnections()
+    while (needed > opening && live < this.options.size) {
+        if (this.openConnection() < 0) needed = 0
+        else {
+            opening = opening + 1
+            live = live + 1
+        }
+    }
+    // Nothing can ever connect: fail queued work instead of waiting forever.
+    if (live == 0 && this.lastConnectError != "") {
+        op = 0
+        while (op < this.opStates.size) {
+            if (this.opStates[op] == 1) this.failOp(op, this.lastConnectError)
+            op = op + 1
+        }
+    }
+    return
+}
+
+fun PgPool.enqueue(kind: int, transaction: int, payload: string, timeoutMilliseconds: int): int {
+    val id = this.nextId
+    this.nextId = this.nextId + 1
+    var op = -1
+    var index = 0
+    while (op < 0 && index < this.opStates.size) {
+        if (this.opStates[index] == 0) op = index
+        index = index + 1
+    }
+    if (op < 0) {
+        op = this.opStates.size
+        this.opIds.append(0)
+        this.opStates.append(0)
+        this.opKinds.append(0)
+        this.opTransactions.append(0)
+        this.opPayloads.append("")
+        this.opDeadlines.append(0)
+        this.opStarted.append(0)
+    }
+    val now = linuxMonotonicMilliseconds()
+    this.opIds[op] = id
+    this.opStates[op] = 1
+    this.opKinds[op] = kind
+    this.opTransactions[op] = transaction
+    this.opPayloads[op] = payload
+    this.opDeadlines[op] = now + (if (timeoutMilliseconds > 0) timeoutMilliseconds
+        else this.options.queryTimeoutMilliseconds)
+    this.opStarted[op] = now
+    this.pendingOps = this.pendingOps + 1
+    if (transaction != 0 && kind != pgAsyncBeginOp && this.transactionIndex(transaction) < 0) {
+        this.failOp(op, "unknown or finished transaction")
+    } else this.dispatch()
+    id
+}
+
+fun PgPool.sweep(now: int): void {
+    var slot = 0
+    while (slot < this.connStates.size) {
+        if ((this.connStates[slot] == pgAsyncConnecting ||
+            this.connStates[slot] == pgAsyncAuthenticating) && now >= this.connDeadlines[slot]) {
+            this.lastConnectError = "Timed out connecting to PostgreSQL"
+            this.address = ""
+            this.closeConnection(slot, this.lastConnectError)
+        }
+        slot = slot + 1
+    }
+    var op = 0
+    while (op < this.opStates.size) {
+        if (this.opStates[op] != 0 && now >= this.opDeadlines[op]) {
+            var owner = -1
+            slot = 0
+            while (owner < 0 && slot < this.connStates.size) {
+                if (this.connOps[slot] == op) owner = slot
+                slot = slot + 1
+            }
+            // A running statement cannot be abandoned on a live session.
+            if (owner >= 0) this.closeConnection(owner, "PostgreSQL query timed out")
+            else this.failOp(op, "PostgreSQL query timed out")
+        }
+        op = op + 1
+    }
+    return
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+
+// Queues a parameterized statement; pass a transaction id from `begin` to run
+// it on that transaction's connection.
+fun PgPool.query(
+    sql: string,
+    parameters: array<PgParameter> = [],
+    transaction: int = 0,
+    timeoutMilliseconds: int = 0
+): int = this.enqueue(
+    pgAsyncQueryOp, transaction, pgExtendedQuery(sql, parameters), timeoutMilliseconds
+)
+
+fun PgPool.execute(
+    sql: string,
+    parameters: array<PgParameter> = [],
+    transaction: int = 0
+): int = this.query(sql, parameters, transaction)
+
+// Starts a transaction and returns its id. The BEGIN itself also produces a
+// result (with the same id as the transaction).
+fun PgPool.begin(): int {
+    val id = this.nextId
+    this.txIds.append(id)
+    this.txConnections.append(-1)
+    this.txFailed.append("")
+    val op = this.enqueue(pgAsyncBeginOp, id, pgExtendedQuery("BEGIN", []), 0)
+    op
+}
+
+fun PgPool.commit(transaction: int): int =
+    this.enqueue(pgAsyncEndOp, transaction, pgExtendedQuery("COMMIT", []), 0)
+
+fun PgPool.rollback(transaction: int): int =
+    this.enqueue(pgAsyncEndOp, transaction, pgExtendedQuery("ROLLBACK", []), 0)
+
+// Progresses every connection for up to `timeoutMilliseconds`.
+fun PgPool.step(timeoutMilliseconds: int = 0): int {
+    var timeout = timeoutMilliseconds
+    if (timeout < 0) timeout = 0
+    if (this.pendingOps > 0 && timeout > 50) timeout = 50
+    val records = this.poller.waitCompact(64, timeout)
+    var handled = 0
+    var index = 0
+    while (index + 12 <= records.size) {
+        val flags = textReadU32LittleEndian(records, index)
+        val descriptor = textReadU32LittleEndian(records, index + 4)
+        if (descriptor >= 0 && descriptor < this.routes.size && this.routes[descriptor] >= 0) {
+            val slot = this.routes[descriptor]
+            this.socketReady(
+                slot, (flags & 1) != 0, (flags & 4) != 0,
+                (flags & 8) != 0 || (flags & 16) != 0 || (flags & 8192) != 0
+            )
+            handled = handled + 1
+        }
+        index = index + 12
+    }
+    this.sweep(linuxMonotonicMilliseconds())
+    this.dispatch()
+    handled
+}
+
+fun PgPool.takeResults(): array<PgAsyncResult> {
+    val taken: array<PgAsyncResult> = []
+    var index = 0
+    while (index < this.results.size) {
+        taken.append(this.results[index])
+        index = index + 1
+    }
+    this.results = []
+    taken
+}
+
+fun PgPool.pending(): int = this.pendingOps
+
+fun PgPool.connectionCount(): int = this.liveConnections()
+
+fun PgPool.pollDescriptor(): int = this.poller.descriptor
+
+// Opens connections up front (optional; they otherwise open on demand).
+fun PgPool.warm(count: int): void {
+    var live = this.liveConnections()
+    while (live < count && live < this.options.size && this.openConnection() >= 0) {
+        live = live + 1
+    }
+    return
+}
