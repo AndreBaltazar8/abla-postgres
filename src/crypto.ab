@@ -19,7 +19,11 @@ fun pgSecureNonce(): string {
 class PgScramProof(
     val clientFinal: string,
     val serverSignature: string,
-    val error: string
+    val error: string,
+    // PBKDF2 output and the "salt/iterations" it belongs to, so a caller that
+    // opens several sessions for one role can skip the expensive derivation.
+    val saltedPassword: string = "",
+    val saltKey: string = ""
 )
 
 fun pgScramAttribute(message: string, name: int): string {
@@ -75,7 +79,9 @@ fun pgSaslName(value: string): string {
 fun pgScramProof(
     password: string,
     clientFirstBare: string,
-    serverFirst: string
+    serverFirst: string,
+    cachedSaltKey: string = "",
+    cachedSaltedPassword: string = ""
 ): PgScramProof {
     var error = ""
     val clientNonce = pgScramAttribute(clientFirstBare, 114)
@@ -96,10 +102,13 @@ fun pgScramProof(
     }
     var clientFinal = ""
     var serverSignature = ""
+    var saltedPassword = ""
+    val saltKey = "$encodedSalt/$iterations"
     if (error == "") {
         val withoutProof = "c=biws,r=$serverNonce"
         val authMessage = "$clientFirstBare,$serverFirst,$withoutProof"
-        val saltedPassword = pbkdf2Sha256(password, salt, iterations)
+        saltedPassword = if (cachedSaltKey == saltKey && cachedSaltedPassword != "")
+            cachedSaltedPassword else pbkdf2Sha256(password, salt, iterations)
         val clientKey = hmacSha256(saltedPassword, "Client Key")
         val storedKey = sha256(clientKey)
         val clientSignature = hmacSha256(storedKey, authMessage)
@@ -110,7 +119,7 @@ fun pgScramProof(
         )
         clientFinal = "$withoutProof,p=${base64Encode(proof)}"
     }
-    PgScramProof(clientFinal, serverSignature, error)
+    PgScramProof(clientFinal, serverSignature, error, saltedPassword, saltKey)
 }
 
 fun pgMd5PasswordResponse(

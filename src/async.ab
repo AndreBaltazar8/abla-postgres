@@ -92,7 +92,11 @@ resource class PgPool(
     var results: array<PgAsyncResult>,
     var nextId: int,
     var pendingOps: int,
-    var lastConnectError: string
+    var lastConnectError: string,
+    var scramSaltKey: string,
+    var scramSaltedPassword: string,
+    var connectFailures: int,
+    var reconnectAfter: int
 ) {
     fun drop(): void {
         var slot = 0
@@ -114,7 +118,7 @@ fun pgPool(config: PgConfig, options: PgPoolOptions = PgPoolOptions()): PgPool =
         [], [], [], [], [], [], [],
         [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [],
         [], [],
-        [], [], [], [], 1, 0, ""
+        [], [], [], [], 1, 0, "", "", "", 0, 0
     )
 
 // postgres://user:password@host:port/database (percent-encoded parts allowed).
@@ -320,6 +324,21 @@ fun PgPool.failTransaction(tx: int, error: string): void {
 
 fun PgPool.closeConnection(slot: int, error: string): void {
     if (slot < 0 || this.connStates[slot] == pgAsyncFree) return
+    if (this.connStates[slot] == pgAsyncConnecting ||
+        this.connStates[slot] == pgAsyncAuthenticating) {
+        // Back off before reconnecting (250 ms doubling to 5 s) so a down or
+        // rejecting server fails queued work instead of spinning.
+        this.lastConnectError = error
+        this.connectFailures = this.connectFailures + 1
+        var backoff = 250
+        var doubling = 1
+        while (doubling < this.connectFailures && backoff < 5000) {
+            backoff = backoff * 2
+            doubling = doubling + 1
+        }
+        if (backoff > 5000) backoff = 5000
+        this.reconnectAfter = linuxMonotonicMilliseconds() + backoff
+    }
     val descriptor = this.connDescriptors[slot]
     if (descriptor >= 0) {
         this.poller.unwatchDescriptor(descriptor)
@@ -472,11 +491,16 @@ fun PgPool.handleAuthentication(slot: int, kind: int, body: string): void {
             this.queueOutput(slot, pgSaslInitialMessage("n,,${this.connClientFirst[slot]}"))
         } else if (method == 11 && this.connClientFirst[slot] != "" &&
             this.connServerSignature[slot] == "") {
+            // Every session of the role shares the salt and iteration count, so
+            // the PBKDF2 derivation runs once per pool, not once per session.
             val proof = pgScramProof(
-                this.config.password, this.connClientFirst[slot], body.slice(4, body.size)
+                this.config.password, this.connClientFirst[slot], body.slice(4, body.size),
+                this.scramSaltKey, this.scramSaltedPassword
             )
             if (proof.error != "") this.closeConnection(slot, proof.error)
             else {
+                this.scramSaltKey = proof.saltKey
+                this.scramSaltedPassword = proof.saltedPassword
                 this.connServerSignature[slot] = proof.serverSignature
                 this.queueOutput(slot, pgSaslResponseMessage(proof.clientFinal))
             }
@@ -498,6 +522,7 @@ fun PgPool.handleAuthentication(slot: int, kind: int, body: string): void {
         } else {
             this.connStates[slot] = pgAsyncIdle
             this.lastConnectError = ""
+            this.connectFailures = 0
         }
     }
     return
@@ -661,15 +686,23 @@ fun PgPool.dispatch(): void {
         slot = slot + 1
     }
     var live = this.liveConnections()
-    while (needed > opening && live < this.options.size) {
-        if (this.openConnection() < 0) needed = 0
-        else {
-            opening = opening + 1
-            live = live + 1
+    val backingOff = this.connectFailures > 0 &&
+        linuxMonotonicMilliseconds() < this.reconnectAfter
+    if (!backingOff) {
+        while (needed > opening && live < this.options.size) {
+            if (this.openConnection() < 0) {
+                needed = 0
+                this.connectFailures = this.connectFailures + 1
+                this.reconnectAfter = linuxMonotonicMilliseconds() + 1000
+            } else {
+                opening = opening + 1
+                live = live + 1
+            }
         }
     }
-    // Nothing can ever connect: fail queued work instead of waiting forever.
-    if (live == 0 && this.lastConnectError != "") {
+    // The server is unreachable or rejecting us: fail queued work instead of
+    // letting it wait for its deadline.
+    if (live == 0 && this.connectFailures > 0 && this.lastConnectError != "") {
         op = 0
         while (op < this.opStates.size) {
             if (this.opStates[op] == 1) this.failOp(op, this.lastConnectError)
