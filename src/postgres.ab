@@ -6,6 +6,7 @@
 import "abla/sys/linux/net"
 import "abla/sys/linux/process"
 import "abla/bytes"
+import "abla/dns"
 import "crypto.ab"
 
 class PgConfig(
@@ -238,23 +239,30 @@ fun PgStream.next(timeoutMilliseconds: int): PgMessage {
     result
 }
 
+/** An IPv4 address for `host`: numeric as-is, "localhost" = 127.0.0.1, else DNS
+ *  (resolv.conf — compose service names included), falling back to `getent
+ *  ahostsv4` (/etc/hosts, NSS) where that exists. "" = unresolvable. */
 fun pgResolveIpv4(host: string): string {
-    val parsed = linuxIpv4Octets(host)
-    var result = host
-    if (parsed.size != 4) {
-        val command = linuxCommand("getent")
-        command.argument("ahostsv4")
-        command.argument(host)
-        val lookup = command.capture()
-        result = ""
-        if (lookup.status == 0) {
-            var end = 0
-            while (end < lookup.output.size && lookup.output[end] != 32 &&
-                lookup.output[end] != 9 && lookup.output[end] != 10) {
-                end = end + 1
-            }
-            if (end > 0) result = lookup.output.slice(0, end)
+    if (linuxIpv4Octets(host).size == 4) return host
+    if (host == "localhost") return "127.0.0.1"
+    val resolution = dnsResolveType(host, 1, 2000)
+    var index = 0
+    while (index < resolution.addresses.size) {
+        if (resolution.addresses[index].family == 4) return resolution.addresses[index].address
+        index = index + 1
+    }
+    val command = linuxCommand("getent")
+    command.argument("ahostsv4")
+    command.argument(host)
+    val lookup = command.capture()
+    var result = ""
+    if (lookup.status == 0) {
+        var end = 0
+        while (end < lookup.output.size && lookup.output[end] != 32 &&
+            lookup.output[end] != 9 && lookup.output[end] != 10) {
+            end = end + 1
         }
+        if (end > 0) result = lookup.output.slice(0, end)
     }
     result
 }
