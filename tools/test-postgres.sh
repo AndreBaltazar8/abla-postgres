@@ -33,7 +33,7 @@ run_mode() {
 
     port=$(docker port "$container" 5432/tcp | sed 's/.*://')
     attempt=0
-    until docker exec "$container" pg_isready -U postgres -d abla_test >/dev/null 2>&1; do
+    until docker exec "$container" pg_isready -h 127.0.0.1 -U postgres -d abla_test >/dev/null 2>&1; do
         attempt=$((attempt + 1))
         if [ "$attempt" -ge 30 ]; then
             docker logs "$container"

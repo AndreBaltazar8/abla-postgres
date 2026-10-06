@@ -184,15 +184,19 @@ fun pgAppendCString(var bytes: array<int>, value: string): void {
     bytes.append(0)
 }
 
+// Protocol bytes are already numeric. Write one contiguous allocation instead
+// of allocating a one-byte string and a chunk entry for every payload byte.
 fun pgBytes(bytes: array<int>): string {
-    val buffer = byteBuffer()
+    val buffer = nativeByteBuffer(bytes.size + 1)
     var index = 0
-    var valid = true
-    while (valid && index < bytes.size) {
-        valid = buffer.appendByteValue(bytes[index])
+    while (index < bytes.size) {
+        val value = bytes[index]
+        if (value < 0 || value > 255) { buffer.close(); return "" }
+        buffer.store(index,value)
         index = index + 1
     }
-    if (valid) buffer.toText() else ""
+    buffer.store(bytes.size,0)
+    buffer.adoptString(bytes.size)
 }
 
 fun pgTypedMessage(kind: int, body: array<int>): string {

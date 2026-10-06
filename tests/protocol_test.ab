@@ -2,6 +2,14 @@ import "../src/postgres.ab"
 import "abla/io"
 
 fun main: int {
+    val octets: array<int> = []
+    var octet = 0
+    while (octet < 256) { octets.append(octet); octet = octet + 1 }
+    val encoded = pgBytes(octets)
+    if (encoded.size != 256 || pgBytes([]) != "" || pgBytes([-1]) != "" || pgBytes([256]) != "") return 201
+    octet = 0
+    while (octet < 256) { if (encoded[octet] != octet) return 202; octet = octet + 1 }
+
     val config = pgConfigFromEnvironment()
     val client = pgClient(config)
     val created = client.execute(
