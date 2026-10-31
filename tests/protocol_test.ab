@@ -1,5 +1,58 @@
 import "../src/postgres.ab"
 import "abla/io"
+import "abla/process/time"
+
+fun withReadTimeout(config: PgConfig, milliseconds: int): PgConfig = PgConfig(
+    config.host, config.port, config.database, config.user, config.password,
+    config.connectTimeoutMilliseconds, milliseconds
+)
+
+// How long a reply may take: the configured limit, one query's own, and that
+// neither cuts off a reply still arriving.
+fun timeoutChecks(config: PgConfig): int {
+    val quick = pgClient(withReadTimeout(config, 300))
+    // Connected already: signing in with SCRAM takes a while of its own.
+    if (!quick.query("SELECT 1", []).succeeded) return 100
+    var started = monotonicMilliseconds()
+    val cut = quick.query("SELECT pg_sleep(1.5)", [])
+    var elapsed = monotonicMilliseconds() - started
+    if (cut.succeeded || cut.error != "Timed out while reading PostgreSQL query result") {
+        eprintln("short limit: ${cut.error}")
+        return 101
+    }
+    if (elapsed < 250 || elapsed > 1200) { eprintln("short limit took $elapsed ms"); return 102 }
+    // That query's connection is gone; the client opens another.
+    if (quick.query("SELECT 'again' AS state", []).first("state") != "again") return 103
+    // One query's own limit, without changing the client's.
+    started = monotonicMilliseconds()
+    val patient = quick.query("SELECT pg_sleep(1) , 'slow' AS state", [], 3000)
+    elapsed = monotonicMilliseconds() - started
+    if (!patient.succeeded || patient.first("state") != "slow" || elapsed < 900) {
+        eprintln("query limit: ${patient.error} after $elapsed ms")
+        return 104
+    }
+    val still = quick.query("SELECT pg_sleep(1.5)", [])
+    quick.close()
+    if (still.succeeded) return 105
+    // A longer configured limit counts: this used to stop at five seconds whatever it said.
+    val longer = pgQuery(withReadTimeout(config, 9000), "SELECT pg_sleep(6), 'long' AS state", [])
+    if (!longer.succeeded || longer.first("state") != "long") {
+        eprintln("long limit: ${longer.error}")
+        return 106
+    }
+    // Over a query's limit through the other entry points as well.
+    if (pgQuery(config, "SELECT pg_sleep(1.5)", [], 300).succeeded) return 107
+    if (pgExecute(config, "SELECT pg_sleep(1.5)", [], 300).succeeded) return 108
+    val session = pgSessionQuery(config, -1, "", "SELECT pg_sleep(1.5)", [], 300)
+    if (session.result.succeeded) return 109
+    // A reply that takes many reads isn't a slow one.
+    val large = pgQuery(withReadTimeout(config, 300), "SELECT repeat('x', 8000000) AS value", [])
+    if (!large.succeeded || large.first("value").size != 8000000) {
+        eprintln("large reply: ${large.error}")
+        return 110
+    }
+    0
+}
 
 fun main: int {
     val octets: array<int> = []
@@ -41,6 +94,8 @@ fun main: int {
     val reusableDescriptor = secondSession.descriptor
     val sessionConnection = TcpConnection(reusableDescriptor)
     sessionConnection.close()
+    val timing = timeoutChecks(config)
+    if (timing != 0) return timing
     if (!created.succeeded) {
         eprintln("create failed: ${created.error}")
         10

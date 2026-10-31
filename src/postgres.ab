@@ -217,16 +217,17 @@ fun pgReadU32(value: string, offset: int): int =
     value[offset] * 16777216 + value[offset + 1] * 65536 +
     value[offset + 2] * 256 + value[offset + 3]
 
+// Waits at most `timeoutMilliseconds` for each piece of the message to arrive, so
+// neither a slow reply nor a large one runs out while bytes keep coming.
 fun PgStream.next(timeoutMilliseconds: int): PgMessage {
-    var attempts = 0
     var enough = this.buffered.size >= 5
     var total = 0
     if (enough) total = 1 + pgReadU32(this.buffered, 1)
-    while (attempts < 20 && (!enough || this.buffered.size < total)) {
-        val slice = if (timeoutMilliseconds < 250) timeoutMilliseconds else 250
-        val chunk = this.connection.readWithTimeout(65536, slice)
-        if (chunk.size > 0) this.buffered = "${this.buffered}$chunk"
-        attempts = attempts + 1
+    var waiting = true
+    while (waiting && (!enough || this.buffered.size < total)) {
+        val chunk = this.connection.readWithTimeoutResult(65536, timeoutMilliseconds)
+        if (chunk.bytes.size > 0) this.buffered = "${this.buffered}${chunk.bytes}"
+        else waiting = false
         enough = this.buffered.size >= 5
         if (enough) total = 1 + pgReadU32(this.buffered, 1)
     }
@@ -551,11 +552,17 @@ fun PgClient.connect(): string {
     error
 }
 
+// `timeoutMilliseconds` replaces the configured read timeout for this query's
+// reply: a long report needn't raise it for everything else. A query that runs
+// out loses the connection, which the next query opens again.
 fun PgClient.query(
     sql: string,
-    parameters: array<PgParameter> = []
+    parameters: array<PgParameter> = [],
+    timeoutMilliseconds: int = 0
 ): PgResult {
     var error = ""
+    val replyTimeout = if (timeoutMilliseconds > 0) timeoutMilliseconds
+        else this.config.readTimeoutMilliseconds
     if (!this.authenticated) error = this.connect()
     val columns: array<string> = []
     val rows: array<array<PgValue>> = []
@@ -572,7 +579,7 @@ fun PgClient.query(
     // PostgreSQL sends ReadyForQuery after an ordinary SQL error. Drain through
     // it so the persistent connection stays protocol-aligned and reusable.
     while (!ready && !transportFailed) {
-        val message = this.stream.next(this.config.readTimeoutMilliseconds)
+        val message = this.stream.next(replyTimeout)
         if (!message.valid) {
             if (error == "") {
                 error = "Timed out while reading PostgreSQL query result"
@@ -599,8 +606,9 @@ fun PgClient.query(
 
 fun PgClient.execute(
     sql: string,
-    parameters: array<PgParameter> = []
-): PgResult = this.query(sql, parameters)
+    parameters: array<PgParameter> = [],
+    timeoutMilliseconds: int = 0
+): PgResult = this.query(sql, parameters, timeoutMilliseconds)
 
 fun PgClient.close(): void = this.disconnect()
 
@@ -609,14 +617,15 @@ fun pgSessionQuery(
     descriptor: int,
     buffered: string,
     sql: string,
-    parameters: array<PgParameter> = []
+    parameters: array<PgParameter> = [],
+    timeoutMilliseconds: int = 0
 ): PgSessionResult {
     val client = PgClient(
         config,
         PgStream(TcpConnection(descriptor), buffered),
         descriptor >= 0
     )
-    val result = client.query(sql, parameters)
+    val result = client.query(sql, parameters, timeoutMilliseconds)
     val nextDescriptor = client.stream.connection.descriptor
     val nextBuffered = client.stream.buffered
     // The scalar session bridge transfers descriptor ownership back to the
@@ -633,10 +642,11 @@ fun pgSessionQuery(
 fun pgQuery(
     config: PgConfig,
     sql: string,
-    parameters: array<PgParameter> = []
+    parameters: array<PgParameter> = [],
+    timeoutMilliseconds: int = 0
 ): PgResult {
     val client = pgClient(config)
-    val result = client.query(sql, parameters)
+    val result = client.query(sql, parameters, timeoutMilliseconds)
     client.close()
     result
 }
@@ -644,5 +654,6 @@ fun pgQuery(
 fun pgExecute(
     config: PgConfig,
     sql: string,
-    parameters: array<PgParameter> = []
-): PgResult = pgQuery(config, sql, parameters)
+    parameters: array<PgParameter> = [],
+    timeoutMilliseconds: int = 0
+): PgResult = pgQuery(config, sql, parameters, timeoutMilliseconds)

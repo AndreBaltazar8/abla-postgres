@@ -793,8 +793,9 @@ fun PgPool.query(
 fun PgPool.execute(
     sql: string,
     parameters: array<PgParameter> = [],
-    transaction: int = 0
-): int = this.query(sql, parameters, transaction)
+    transaction: int = 0,
+    timeoutMilliseconds: int = 0
+): int = this.query(sql, parameters, transaction, timeoutMilliseconds)
 
 // Starts a transaction and returns its id. The BEGIN itself also produces a
 // result (with the same id as the transaction).

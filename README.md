@@ -51,7 +51,13 @@ For Docker/Icy secrets, set `POSTGRES_PASSWORD_FILE` to the mounted secret
 path instead. A direct `POSTGRES_PASSWORD` takes precedence.
 
 `POSTGRES_CONNECT_TIMEOUT_MS` and `POSTGRES_READ_TIMEOUT_MS` are optional and
-default to 3000 and 5000 milliseconds.
+default to 3000 and 5000 milliseconds. The read timeout is how long the client
+waits for the next bytes of a reply, so a query that takes longer than it fails
+unless the query gives its own: `client.query(sql, parameters, 60000)`, and
+likewise as the last argument of `execute`, `pgQuery`, `pgExecute`,
+`pgSessionQuery` and, on a pool, `query` and `execute`. A query that runs out
+loses its connection, and the next query opens another. PostgreSQL may keep
+working on it, so set `statement_timeout` where that matters.
 
 ```abla
 import github("AndreBaltazar8/abla-postgres")
