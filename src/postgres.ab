@@ -560,16 +560,37 @@ fun PgClient.query(
     parameters: array<PgParameter> = [],
     timeoutMilliseconds: int = 0
 ): PgResult {
-    var error = ""
     val replyTimeout = if (timeoutMilliseconds > 0) timeoutMilliseconds
         else this.config.readTimeoutMilliseconds
+    this.exchange(pgExtendedQuery(sql, parameters), replyTimeout)
+}
+
+// Several statements in one string, as in a migration file, through the simple
+// query protocol: no parameters, and one transaction unless the text has its
+// own. The first error stops the rest. The connection is then still inside any
+// BEGIN of the text, so close it rather than reuse it after a failure. Columns
+// and rows are those of every statement that returned any, together.
+fun PgClient.script(
+    sql: string,
+    timeoutMilliseconds: int = 0
+): PgResult {
+    val body: array<int> = []
+    pgAppendCString(body, sql)
+    this.exchange(
+        pgTypedMessage(81, body),
+        if (timeoutMilliseconds > 0) timeoutMilliseconds
+        else this.config.readTimeoutMilliseconds
+    )
+}
+
+private fun PgClient.exchange(request: string, replyTimeout: int): PgResult {
+    var error = ""
     if (!this.authenticated) error = this.connect()
     val columns: array<string> = []
     val rows: array<array<PgValue>> = []
     var command = ""
     var transportFailed = false
     if (error == "") {
-        val request = pgExtendedQuery(sql, parameters)
         if (this.stream.connection.write(request) < 0) {
             error = "Could not send PostgreSQL query"
             transportFailed = true
