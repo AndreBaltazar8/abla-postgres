@@ -1,3 +1,4 @@
+import "abla/text"
 import "../src/postgres.ab"
 import "abla/io"
 import "abla/process/time"
@@ -50,6 +51,17 @@ fun timeoutChecks(config: PgConfig): int {
     if (!large.succeeded || large.first("value").size != 8000000) {
         eprintln("large reply: ${large.error}")
         return 110
+    }
+    // The largest it takes comes through, and past it says why, at once, rather than timing out.
+    val largest = pgQuery(withReadTimeout(config, 300), "SELECT repeat('x', 16000000) AS value", [])
+    if (!largest.succeeded || largest.first("value").size != 16000000) {
+        eprintln("largest reply: ${largest.error}")
+        return 111
+    }
+    val tooLarge = pgQuery(withReadTimeout(config, 60000), "SELECT repeat('x', 17000000) AS value", [])
+    if (tooLarge.succeeded || !tooLarge.error.contains("over 16 MiB")) {
+        eprintln("oversized reply: ${tooLarge.error}")
+        return 112
     }
     0
 }

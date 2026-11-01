@@ -217,6 +217,9 @@ fun pgReadU32(value: string, offset: int): int =
     value[offset] * 16777216 + value[offset + 1] * 65536 +
     value[offset + 2] * 256 + value[offset + 3]
 
+val pgLargestMessage = 16777216
+val pgOversizedMessage = -1
+
 // Waits at most `timeoutMilliseconds` for each piece of the message to arrive, so
 // neither a slow reply nor a large one runs out while bytes keep coming.
 fun PgStream.next(timeoutMilliseconds: int): PgMessage {
@@ -224,7 +227,7 @@ fun PgStream.next(timeoutMilliseconds: int): PgMessage {
     var total = 0
     if (enough) total = 1 + pgReadU32(this.buffered, 1)
     var waiting = true
-    while (waiting && (!enough || this.buffered.size < total)) {
+    while (waiting && (!enough || (total <= pgLargestMessage && this.buffered.size < total))) {
         val chunk = this.connection.readWithTimeoutResult(65536, timeoutMilliseconds)
         if (chunk.bytes.size > 0) this.buffered = "${this.buffered}${chunk.bytes}"
         else waiting = false
@@ -232,8 +235,8 @@ fun PgStream.next(timeoutMilliseconds: int): PgMessage {
         if (enough) total = 1 + pgReadU32(this.buffered, 1)
     }
     var result = PgMessage(0, "", false)
-    if (enough && total >= 5 && total <= 16777216 &&
-        this.buffered.size >= total) {
+    if (enough && total > pgLargestMessage) result = PgMessage(pgOversizedMessage, "", false)
+    else if (enough && total >= 5 && this.buffered.size >= total) {
         result = PgMessage(
             this.buffered[0],
             this.buffered.slice(5, total),
@@ -603,7 +606,8 @@ private fun PgClient.exchange(request: string, replyTimeout: int): PgResult {
         val message = this.stream.next(replyTimeout)
         if (!message.valid) {
             if (error == "") {
-                error = "Timed out while reading PostgreSQL query result"
+                error = if (message.kind == pgOversizedMessage) "PostgreSQL sent a single message over 16 MiB: return fewer columns per row, or split the aggregate"
+                else "Timed out while reading PostgreSQL query result"
             }
             transportFailed = true
         } else if (message.kind == 69) error = pgErrorMessage(message.body)

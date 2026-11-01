@@ -57,7 +57,8 @@ unless the query gives its own: `client.query(sql, parameters, 60000)`, and
 likewise as the last argument of `execute`, `pgQuery`, `pgExecute`,
 `pgSessionQuery` and, on a pool, `query` and `execute`. A query that runs out
 loses its connection, and the next query opens another. PostgreSQL may keep
-working on it, so set `statement_timeout` where that matters.
+working on it, so set `statement_timeout` where that matters. A single message
+over 16 MiB is refused with an error that says so, and also loses its connection.
 
 ```abla
 import github("AndreBaltazar8/abla-postgres")
