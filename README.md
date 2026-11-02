@@ -17,6 +17,7 @@ The current release includes:
   authentication;
 - RFC-compatible SHA-256/HMAC/PBKDF2 proofs from `abla/crypto`, with server-signature
   verification;
+- TLS, by its own import so that only programs using it link OpenSSL; 
 - environment-based configuration; and
 - numeric IPv4 plus Docker/Icy service-name resolution.
 
@@ -34,6 +35,20 @@ During sibling-checkout development, import it directly:
 ```abla
 import "../../abla-postgres/src/postgres.ab"
 ```
+
+
+## TLS
+
+`import github("AndreBaltazar8/abla-postgres/tls")` and a call to `pgTlsEnable()` add it, and then
+a `PgConfig`'s `sslMode` and `sslRootCert`, or `POSTGRES_SSLMODE` and `POSTGRES_SSLROOTCERT`, ask for it:
+
+- `disable`, the default: plain;
+- `require`: encrypted, with no check of who answers;
+- `verify-ca`: the certificate chains to the CA file in `sslRootCert` (or `system`);
+- `verify-full`: that, and it names `host`, as a name or as an address.
+
+There's no fallback: a server without TLS, a certificate that doesn't check out, or a program that asks without
+having added it gets an error, not a plain connection. Without the import a program links no OpenSSL. The async pool has no TLS, and says so.
 
 ## Querying
 

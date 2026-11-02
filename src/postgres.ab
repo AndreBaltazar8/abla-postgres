@@ -16,7 +16,12 @@ class PgConfig(
     val user: string,
     val password: string,
     val connectTimeoutMilliseconds: int = 3000,
-    val readTimeoutMilliseconds: int = 5000
+    val readTimeoutMilliseconds: int = 5000,
+    // As libpq's: disable, require (encrypted, no check of who answers), verify-ca, verify-full.
+    // Anything but disable needs the "tls" subpath: see src/tls.ab. It never falls back to plain text.
+    val sslMode: string = "disable",
+    // The CA file of verify-ca and verify-full, or "system".
+    val sslRootCert: string = ""
 )
 
 class PgParameter(val value: string, val isNull: bool)
@@ -63,7 +68,18 @@ class PgResult(
 
 class PgMessage(val kind: int, val body: string, val valid: bool)
 
-class PgStream(val connection: TcpConnection, var buffered: string)
+// `tls` is the handle of the TLS session that took the connection over, 0 without one.
+class PgStream(val connection: TcpConnection, var buffered: string, var tls: int)
+
+// What src/tls.ab adds, so that only a program importing it links OpenSSL.
+interface PgTls {
+    fun upgrade(var connection: TcpConnection, host: string, mode: string, rootCert: string, timeoutMilliseconds: int): int
+    fun failure(): string
+    fun send(handle: int, bytes: string): int
+    fun receive(handle: int, timeoutMilliseconds: int): string
+    fun close(handle: int): void
+}
+val pgTlsAdded: array<PgTls> = []
 
 // A reusable authenticated PostgreSQL session. The server-side HTTP runtime is
 // currently single-threaded, so one client can safely serve consecutive
@@ -83,7 +99,7 @@ class PgSessionResult(
     val result: PgResult
 )
 
-fun pgDisconnectedStream(): PgStream = PgStream(TcpConnection(-1), "")
+fun pgDisconnectedStream(): PgStream = PgStream(TcpConnection(-1), "", 0)
 
 fun pgClient(config: PgConfig): PgClient = PgClient(
     config,
@@ -156,7 +172,9 @@ fun pgConfigFromEnvironment(): PgConfig = PgConfig(
     pgEnvironment("POSTGRES_USER", "postgres"),
     pgSecretEnvironment("POSTGRES_PASSWORD", "POSTGRES_PASSWORD_FILE", ""),
     pgParsePositiveInt(pgEnvironment("POSTGRES_CONNECT_TIMEOUT_MS", "3000"), 3000),
-    pgParsePositiveInt(pgEnvironment("POSTGRES_READ_TIMEOUT_MS", "5000"), 5000)
+    pgParsePositiveInt(pgEnvironment("POSTGRES_READ_TIMEOUT_MS", "5000"), 5000),
+    pgEnvironment("POSTGRES_SSLMODE", "disable"),
+    pgEnvironment("POSTGRES_SSLROOTCERT", "")
 )
 
 fun pgAppendU16(var bytes: array<int>, value: int): void {
@@ -222,14 +240,18 @@ val pgOversizedMessage = -1
 
 // Waits at most `timeoutMilliseconds` for each piece of the message to arrive, so
 // neither a slow reply nor a large one runs out while bytes keep coming.
+fun PgStream.send(bytes: string): int =
+    if (this.tls != 0) pgTlsAdded[0].send(this.tls, bytes) else this.connection.write(bytes)
+
 fun PgStream.next(timeoutMilliseconds: int): PgMessage {
     var enough = this.buffered.size >= 5
     var total = 0
     if (enough) total = 1 + pgReadU32(this.buffered, 1)
     var waiting = true
     while (waiting && (!enough || (total <= pgLargestMessage && this.buffered.size < total))) {
-        val chunk = this.connection.readWithTimeoutResult(65536, timeoutMilliseconds)
-        if (chunk.bytes.size > 0) this.buffered = "${this.buffered}${chunk.bytes}"
+        val chunk = if (this.tls != 0) pgTlsAdded[0].receive(this.tls, timeoutMilliseconds)
+            else this.connection.readWithTimeoutResult(65536, timeoutMilliseconds).bytes
+        if (chunk.size > 0) this.buffered = "${this.buffered}$chunk"
         else waiting = false
         enough = this.buffered.size >= 5
         if (enough) total = 1 + pgReadU32(this.buffered, 1)
@@ -313,8 +335,32 @@ fun pgConnect(config: PgConfig): PgStream {
     val address = pgResolveIpv4(config.host)
     PgStream(
         tcpConnectIpv4(address, config.port, config.connectTimeoutMilliseconds),
-        ""
+        "",
+        0
     )
+}
+
+fun pgTlsProblem(config: PgConfig): string {
+    val mode = config.sslMode
+    if (mode == "disable") return ""
+    if (mode != "require" && mode != "verify-ca" && mode != "verify-full") return "Unknown PostgreSQL sslmode: $mode"
+    if (pgTlsAdded.size == 0) return "sslmode $mode needs TLS, which this program doesn't have: import abla-postgres' tls subpath and call pgTlsEnable()"
+    if (mode != "require" && config.sslRootCert == "") return "sslmode $mode needs a CA file to check the server against"
+    ""
+}
+
+// Asks for TLS before anything else goes over the connection (the protocol's SSLRequest), and takes one byte of the
+// answer: anything sent behind it, in the clear, must not be read as if it had come over TLS (CVE-2021-23222).
+fun pgTlsNegotiate(var stream: PgStream, config: PgConfig): string {
+    if (config.sslMode == "disable" || stream.connection.descriptor < 0) return ""
+    if (stream.connection.write("\x00\x00\x00\x08\x04\xd2\x16\x2f") < 0) return "Could not ask PostgreSQL for TLS"
+    val answer = stream.connection.readWithTimeoutResult(1, config.readTimeoutMilliseconds).bytes
+    if (answer != "S") return "PostgreSQL at ${config.host}:${config.port} doesn't offer TLS, and sslmode ${config.sslMode} requires it"
+    val tls = pgTlsAdded[0]
+    val handle = tls.upgrade(stream.connection, config.host, config.sslMode, config.sslRootCert, config.connectTimeoutMilliseconds)
+    if (handle == 0) return "TLS with PostgreSQL at ${config.host}:${config.port} failed under sslmode ${config.sslMode}: ${tls.failure()}"
+    stream.tls = handle
+    ""
 }
 
 fun pgPasswordMessage(value: string): string {
@@ -351,9 +397,9 @@ fun pgAuthenticationOffers(body: string, mechanism: string): bool {
 
 fun pgAuthenticate(var stream: PgStream, config: PgConfig): string {
     var error = ""
-    if (stream.connection.descriptor < 0) {
+    if (stream.connection.descriptor < 0 && stream.tls == 0) {
         error = "Could not connect to PostgreSQL at ${config.host}:${config.port}"
-    } else if (stream.connection.write(pgBytes(pgStartup(config))) < 0) {
+    } else if (stream.send(pgBytes(pgStartup(config))) < 0) {
         error = "Could not send PostgreSQL startup message"
     } else {
         var ready = false
@@ -380,7 +426,7 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig): string {
                             error = "PostgreSQL requested a duplicate password response"
                         } else {
                             passwordResponseSent = true
-                            if (stream.connection.write(
+                            if (stream.send(
                                 pgPasswordMessage(config.password)
                             ) < 0) error = "Could not send PostgreSQL password"
                         }
@@ -394,7 +440,7 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig): string {
                                 config.password,
                                 message.body.slice(4, 8)
                             )
-                            if (response == "" || stream.connection.write(
+                            if (response == "" || stream.send(
                                 pgPasswordMessage(response)
                             ) < 0) error = "Could not send PostgreSQL MD5 password response"
                         }
@@ -412,7 +458,7 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig): string {
                                 clientFirstBare =
                                     "n=${pgSaslName(config.user)},r=$nonce"
                                 val initial = "n,,$clientFirstBare"
-                                if (stream.connection.write(
+                                if (stream.send(
                                     pgSaslInitialMessage(initial)
                                 ) < 0) error = "Could not begin PostgreSQL SCRAM authentication"
                             }
@@ -430,7 +476,7 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig): string {
                             if (proof.error != "") error = proof.error
                             else {
                                 expectedServerSignature = proof.serverSignature
-                                if (stream.connection.write(
+                                if (stream.send(
                                     pgSaslResponseMessage(proof.clientFinal)
                                 ) < 0) error = "Could not send PostgreSQL SCRAM proof"
                             }
@@ -540,6 +586,8 @@ fun pgExtendedQuery(sql: string, parameters: array<PgParameter>): string {
 }
 
 fun PgClient.disconnect(): void {
+    if (this.stream.tls != 0) pgTlsAdded[0].close(this.stream.tls)
+    this.stream.tls = 0
     if (this.stream.connection.descriptor >= 0) this.stream.connection.close()
     this.stream = pgDisconnectedStream()
     this.authenticated = false
@@ -548,8 +596,11 @@ fun PgClient.disconnect(): void {
 
 fun PgClient.connect(): string {
     this.disconnect()
+    val problem = pgTlsProblem(this.config)
+    if (problem != "") return problem
     this.stream = pgConnect(this.config)
-    val error = pgAuthenticate(this.stream, this.config)
+    var error = pgTlsNegotiate(this.stream, this.config)
+    if (error == "") error = pgAuthenticate(this.stream, this.config)
     if (error == "") this.authenticated = true
     else this.disconnect()
     error
@@ -594,7 +645,7 @@ private fun PgClient.exchange(request: string, replyTimeout: int): PgResult {
     var command = ""
     var transportFailed = false
     if (error == "") {
-        if (this.stream.connection.write(request) < 0) {
+        if (this.stream.send(request) < 0) {
             error = "Could not send PostgreSQL query"
             transportFailed = true
         }
@@ -637,6 +688,9 @@ fun PgClient.execute(
 
 fun PgClient.close(): void = this.disconnect()
 
+// A TLS session's handle, as a descriptor: above any real one.
+val pgSessionTls = 4611686018427387904
+
 fun pgSessionQuery(
     config: PgConfig,
     descriptor: int,
@@ -647,11 +701,12 @@ fun pgSessionQuery(
 ): PgSessionResult {
     val client = PgClient(
         config,
-        PgStream(TcpConnection(descriptor), buffered),
+        if (descriptor >= pgSessionTls) PgStream(TcpConnection(-1), buffered, descriptor - pgSessionTls)
+        else PgStream(TcpConnection(descriptor), buffered, 0),
         descriptor >= 0
     )
     val result = client.query(sql, parameters, timeoutMilliseconds)
-    val nextDescriptor = client.stream.connection.descriptor
+    val nextDescriptor = if (client.stream.tls != 0) pgSessionTls + client.stream.tls else client.stream.connection.descriptor
     val nextBuffered = client.stream.buffered
     // The scalar session bridge transfers descriptor ownership back to the
     // caller. Prevent structural cleanup of the temporary client from closing

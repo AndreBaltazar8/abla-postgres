@@ -1,0 +1,82 @@
+// TLS for abla-postgres, by its own import, as OpenSSL links only into programs that reach it:
+//     import github("AndreBaltazar8/abla-postgres/tls")
+//     pgTlsEnable()
+// after which a PgConfig's sslMode, or POSTGRES_SSLMODE and POSTGRES_SSLROOTCERT, ask for it. Without the call, a program
+// that asks gets an error saying so, and never a plain connection.
+import "postgres.ab"
+import "abla/tls/hosted"
+import "abla/sys/linux/net"
+
+trusted noescape extern:"c" fun SSL_get0_param(session: i64*): i64*
+trusted noescape extern:"c" fun X509_VERIFY_PARAM_set1_ip_asc(parameters: i64*, address: cstring): i32
+
+private fun pgTlsIsAddress(host: string): bool {
+    for (c in host) if (!((c >= 48 && c <= 57) || c == 46 || c == 58)) return false
+    true
+}
+
+// As stdlib's tlsUpgrade, which always checks the name: what is checked follows the mode. An address is checked as one,
+// which is what a certificate's IP entries are for, and isn't sent as a server name, as RFC 6066 has only names there.
+trusted fun pgTlsHandshake(var connection: TcpConnection, host: string, mode: string, rootCert: string, timeoutMilliseconds: int): int {
+    val checks = mode != "require"
+    val context = SSL_CTX_new(TLS_client_method())
+    var ready = !pointerIsNull(context)
+    if (ready) {
+        SSL_CTX_set_verify(context, if (checks) 1 else 0, nativeNullPointer())
+        if (checks) ready = (if (rootCert == "system") SSL_CTX_set_default_verify_paths(context) else SSL_CTX_load_verify_locations(context, rootCert, nativeNullPointer())) == 1
+    }
+    val session = if (ready) SSL_new(context) else nativeNullPointer()
+    ready = ready && !pointerIsNull(session)
+    val address = pgTlsIsAddress(host)
+    if (ready && !address) ready = SSL_ctrl(session, 55, 0, host) == 1
+    if (ready && mode == "verify-full") {
+        ready = if (address) X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(session), host) == 1 else SSL_set1_host(session, host) == 1
+    }
+    if (ready) ready = SSL_set_fd(session, connection.descriptor) == 1
+    if (ready) {
+        linuxSocketSetTimeouts(connection.descriptor, timeoutMilliseconds, timeoutMilliseconds)
+        ERR_clear_error()
+        val held = linuxBrokenPipeHold()
+        ready = SSL_connect(session) == 1
+        linuxBrokenPipeRelease(held)
+    }
+    if (ready && checks) ready = SSL_get_verify_result(session) == 0
+    if (!ready) {
+        if (!pointerIsNull(session)) SSL_free(session)
+        if (!pointerIsNull(context)) SSL_CTX_free(context)
+        connection.close()
+        return 0
+    }
+    val handle = tlsAllocateConnection(context, session, connection.descriptor, true)
+    connection.descriptor = -1
+    handle
+}
+
+class PgOpenSsl() : PgTls {
+    fun upgrade(var connection: TcpConnection, host: string, mode: string, rootCert: string, timeoutMilliseconds: int): int =
+        pgTlsHandshake(connection, host, mode, rootCert, timeoutMilliseconds)
+    fun failure(): string = "the handshake failed, or the server's certificate isn't what was asked for"
+    fun send(handle: int, bytes: string): int {
+        var connection = TlsConnection(handle)
+        val sent = connection.write(bytes)
+        connection.handle = -1
+        sent
+    }
+    fun receive(handle: int, timeoutMilliseconds: int): string {
+        var connection = TlsConnection(handle)
+        connection.setTimeouts(timeoutMilliseconds, timeoutMilliseconds)
+        val bytes = connection.read(65536)
+        connection.handle = -1
+        bytes
+    }
+    fun close(handle: int): void {
+        var connection = TlsConnection(handle)
+        connection.close()
+        return
+    }
+}
+
+fun pgTlsEnable(): void {
+    if (pgTlsAdded.size == 0) pgTlsAdded.append(PgOpenSsl())
+    return
+}

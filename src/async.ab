@@ -397,6 +397,10 @@ fun PgPool.writeReady(slot: int): void {
 }
 
 fun PgPool.openConnection(): int {
+    if (this.config.sslMode != "disable") {
+        this.lastConnectError = "The async pool has no TLS: sslmode ${this.config.sslMode} is only for PgClient and pgQuery"
+        return -1
+    }
     if (this.address == "") this.address = pgAsyncResolve(this.config.host)
     if (this.address == "") {
         this.lastConnectError = "Could not resolve PostgreSQL host ${this.config.host}"

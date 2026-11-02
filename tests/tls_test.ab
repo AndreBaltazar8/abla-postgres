@@ -1,0 +1,23 @@
+// One program, told by the environment what to ask: an answer over TLS prints "ssl", a plain one "plain", and a refusal its error.
+import "abla/io"
+import "../src/postgres.ab"
+import "../src/tls.ab"
+
+fun main: int {
+    pgTlsEnable()
+    val config = pgConfigFromEnvironment()
+    val asked = pgQuery(config, "SELECT ssl::text AS ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()")
+    if (!asked.succeeded) {
+        println("refused: ${asked.error}")
+        return 1
+    }
+    // The session bridge, as a long-running service keeps it.
+    val first = pgSessionQuery(config, -1, "", "SELECT 1::text AS one")
+    val second = pgSessionQuery(config, first.descriptor, first.buffered, "SELECT 2::text AS two")
+    if (second.result.first("two") != "2") {
+        println("the session broke: ${second.result.error}")
+        return 1
+    }
+    println(if (asked.first("ssl") == "true") "ssl" else "plain")
+    0
+}
