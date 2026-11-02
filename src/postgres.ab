@@ -317,8 +317,11 @@ fun pgStartup(config: PgConfig): array<int> {
     packet
 }
 
+// An ErrorResponse's message, and its DETAIL on a line of its own when it has one, as psql shows them: the detail is often what
+// says why (`User does not have CONNECT privilege.`, `Key (id)=(1) already exists.`).
 fun pgErrorMessage(body: string): string {
     var message = "PostgreSQL error"
+    var detail = ""
     var index = 0
     while (index < body.size && body[index] != 0) {
         val field = body[index]
@@ -326,9 +329,10 @@ fun pgErrorMessage(body: string): string {
         val begin = index
         while (index < body.size && body[index] != 0) index = index + 1
         if (field == 77) message = body.slice(begin, index)
+        else if (field == 68) detail = body.slice(begin, index)
         index = index + 1
     }
-    message
+    if (detail == "") message else "$message\nDETAIL: $detail"
 }
 
 fun pgConnect(config: PgConfig): PgStream {
