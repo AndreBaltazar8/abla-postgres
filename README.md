@@ -150,6 +150,10 @@ The asynchronous pool follows the same rule: a running COMMIT with a lost reply
 is uncertain, while an unsent queued COMMIT is not. A failed transaction's queued
 operations fail together, and its transaction ID cannot be revived on a different
 connection. Neither client replays database statements automatically.
+Use the pool's `begin()`, `commit()` and `rollback()` methods for transaction
+boundaries; raw boundary SQL through `pool.query()` is refused. After connection
+loss, `ROLLBACK AND CHAIN` is refused rather than claiming a new transaction
+started on a missing connection; use a simple rollback/reset, then a fresh BEGIN.
 
 Use `pgNull()` for a SQL null value:
 

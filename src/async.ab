@@ -51,6 +51,7 @@ val pgAsyncQueryOp = 0
 val pgAsyncBeginOp = 1
 val pgAsyncEndOp = 2
 val pgAsyncCommitOp = 3
+val pgAsyncRejectedOp = 4
 
 resource class PgPool(
     val config: PgConfig,
@@ -529,6 +530,8 @@ fun PgPool.handleAuthentication(slot: int, kind: int, body: string): void {
     } else if (kind == 90) {
         if (!this.connAuthenticated[slot]) {
             this.closeConnection(slot, "PostgreSQL became ready before authentication completed")
+        } else if (body.size != 1 || body[0] != 73) {
+            this.closeConnection(slot,"PostgreSQL startup did not finish in idle transaction state")
         } else {
             this.connStates[slot] = pgAsyncIdle
             this.lastConnectError = ""
@@ -556,6 +559,10 @@ fun PgPool.handleQueryMessage(slot: int, kind: int, body: string): void {
             return
         }
         val op = this.connOps[slot]
+        if (op >= 0 && this.opTransactions[op] == 0 && body[0] != 73) {
+            this.closeConnection(slot,"PostgreSQL opened an untracked transaction; use the pool transaction API")
+            return
+        }
         this.connOps[slot] = -1
         this.connStates[slot] = pgAsyncIdle
         var error = this.connErrors[slot]
@@ -779,7 +786,9 @@ fun PgPool.enqueue(kind: int, transaction: int, payload: string, timeoutMillisec
         else this.options.queryTimeoutMilliseconds)
     this.opStarted[op] = now
     this.pendingOps = this.pendingOps + 1
-    if (transaction != 0 && kind != pgAsyncBeginOp && this.transactionIndex(transaction) < 0) {
+    if (kind == pgAsyncRejectedOp) {
+        this.failOp(op,payload)
+    } else if (transaction != 0 && kind != pgAsyncBeginOp && this.transactionIndex(transaction) < 0) {
         this.failOp(op, "unknown or finished transaction")
     } else this.dispatch()
     id
@@ -824,9 +833,10 @@ fun PgPool.query(
     parameters: array<PgParameter> = [],
     transaction: int = 0,
     timeoutMilliseconds: int = 0
-): int = this.enqueue(
-    pgAsyncQueryOp, transaction, pgExtendedQuery(sql, parameters), timeoutMilliseconds
-)
+): int {
+    if (pgTransactionControl(sql) != 0) return this.enqueue(pgAsyncRejectedOp,transaction,"Use pool.begin(), commit() or rollback() for transaction boundaries",timeoutMilliseconds)
+    this.enqueue(pgAsyncQueryOp, transaction, pgExtendedQuery(sql, parameters), timeoutMilliseconds)
+}
 
 fun PgPool.execute(
     sql: string,
