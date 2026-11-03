@@ -22,7 +22,9 @@ class PgConfig(
     // Anything but disable needs the "tls" subpath: see src/tls.ab. It never falls back to plain text.
     val sslMode: string = "disable",
     // The CA file of verify-ca and verify-full, or "system".
-    val sslRootCert: string = ""
+    val sslRootCert: string = "",
+    // A candidate must prove it is writable before application SQL is sent.
+    val targetSessionAttrs: string = "read-write"
 )
 
 // Keep connection policy when giving a dedicated checkpoint/lease session its
@@ -30,8 +32,62 @@ class PgConfig(
 // host-selection policy is added.
 fun pgConfigWithTimeouts(config: PgConfig, connectMilliseconds: int, readMilliseconds: int): PgConfig = PgConfig(
     config.host,config.port,config.database,config.user,config.password,
-    connectMilliseconds,readMilliseconds,config.sslMode,config.sslRootCert
+    connectMilliseconds,readMilliseconds,config.sslMode,config.sslRootCert,config.targetSessionAttrs
 )
+
+class PgCandidate(val host: string, val port: int)
+
+fun pgCandidates(config: PgConfig): array<PgCandidate> {
+    val out: array<PgCandidate> = []
+    for (part in config.host.split(",")) {
+        val text = part.trim()
+        val pieces = text.split(":")
+        val host = pieces[0].trim()
+        val port = if (pieces.size == 2) pgInt(pieces[1].trim()) else config.port
+        if (host == "" || pieces.size > 2 || port <= 0 || port > 65535 || out.size >= 32) return []
+        out.append(PgCandidate(host,port))
+    }
+    out
+}
+
+fun pgCandidateConfig(config: PgConfig, candidate: PgCandidate, connectMilliseconds: int): PgConfig = PgConfig(
+    candidate.host,candidate.port,config.database,config.user,config.password,
+    connectMilliseconds,config.readTimeoutMilliseconds,config.sslMode,config.sslRootCert,config.targetSessionAttrs
+)
+
+fun pgRemaining(deadline: int, maximum: int): int {
+    val left = deadline-linuxMonotonicMilliseconds()
+    if (left <= 0) 0 else if (left < maximum) left else maximum
+}
+
+// Numeric candidates and /etc/hosts need no resolver process. DNS uses only
+// the remaining budget; an unbounded NSS/getent fallback is never used here.
+fun pgResolveCandidate(host: string, deadline: int): string {
+    if (linuxIpv4Octets(host).size == 4) return host
+    if (host == "localhost") return "127.0.0.1"
+    for (line in linuxReadFile("/etc/hosts",1048576).split("\n")) {
+        val words = line.replace("\t"," ").split(" ")
+        var address = ""
+        for (word in words) {
+            if (word.startsWith("#")) break
+            if (word != "") {
+                if (address == "") address = word
+                else if (word == host && linuxIpv4Octets(address).size == 4) return address
+            }
+        }
+    }
+    // dnsResolveType's timeout is per search name. Ask absolute candidates one
+    // at a time so a long search-domain list shares the original deadline too.
+    val configuration = dnsReadConfiguration()
+    for (name in dnsCandidates(host,configuration)) {
+        val budget = pgRemaining(deadline,2000)
+        if (budget <= 0) return ""
+        val result = dnsResolveType("$name.",1,budget)
+        for (address in result.addresses) if (address.family == 4) return address.address
+        if (!result.succeeded && !result.nameNotFound) return ""
+    }
+    ""
+}
 
 class PgParameter(val value: string, val isNull: bool)
 
@@ -200,7 +256,8 @@ fun pgConfigFromEnvironment(): PgConfig = PgConfig(
     pgParsePositiveInt(pgEnvironment("POSTGRES_CONNECT_TIMEOUT_MS", "3000"), 3000),
     pgParsePositiveInt(pgEnvironment("POSTGRES_READ_TIMEOUT_MS", "5000"), 5000),
     pgEnvironment("POSTGRES_SSLMODE", "disable"),
-    pgEnvironment("POSTGRES_SSLROOTCERT", "")
+    pgEnvironment("POSTGRES_SSLROOTCERT", ""),
+    pgEnvironment("POSTGRES_TARGET_SESSION_ATTRS", "read-write")
 )
 
 fun pgAppendU16(var bytes: array<int>, value: int): void {
@@ -269,14 +326,16 @@ val pgOversizedMessage = -1
 fun PgStream.send(bytes: string): int =
     if (this.tls != 0) pgTlsAdded[0].send(this.tls, bytes) else this.connection.write(bytes)
 
-fun PgStream.next(timeoutMilliseconds: int): PgMessage {
+fun PgStream.next(timeoutMilliseconds: int, deadline: int = 0): PgMessage {
     var enough = this.buffered.size >= 5
     var total = 0
     if (enough) total = 1 + pgReadU32(this.buffered, 1)
     var waiting = true
     while (waiting && (!enough || (total <= pgLargestMessage && this.buffered.size < total))) {
-        val chunk = if (this.tls != 0) pgTlsAdded[0].receive(this.tls, timeoutMilliseconds)
-            else this.connection.readWithTimeoutResult(65536, timeoutMilliseconds).bytes
+        val budget = if (deadline > 0) pgRemaining(deadline,timeoutMilliseconds) else timeoutMilliseconds
+        if (budget <= 0) return PgMessage(0,"",false)
+        val chunk = if (this.tls != 0) pgTlsAdded[0].receive(this.tls, budget)
+            else this.connection.readWithTimeoutResult(65536, budget).bytes
         if (chunk.size > 0) this.buffered = "${this.buffered}$chunk"
         else waiting = false
         enough = this.buffered.size >= 5
@@ -433,13 +492,17 @@ fun pgTlsProblem(config: PgConfig): string {
 
 // Asks for TLS before anything else goes over the connection (the protocol's SSLRequest), and takes one byte of the
 // answer: anything sent behind it, in the clear, must not be read as if it had come over TLS (CVE-2021-23222).
-fun pgTlsNegotiate(var stream: PgStream, config: PgConfig): string {
+fun pgTlsNegotiate(var stream: PgStream, config: PgConfig, deadline: int = 0): string {
     if (config.sslMode == "disable" || stream.connection.descriptor < 0) return ""
     if (stream.connection.write("\x00\x00\x00\x08\x04\xd2\x16\x2f") < 0) return "Could not ask PostgreSQL for TLS"
-    val answer = stream.connection.readWithTimeoutResult(1, config.readTimeoutMilliseconds).bytes
+    val readBudget = if (deadline > 0) pgRemaining(deadline,config.readTimeoutMilliseconds) else config.readTimeoutMilliseconds
+    if (readBudget <= 0) return "PostgreSQL TLS connection deadline exceeded"
+    val answer = stream.connection.readWithTimeoutResult(1, readBudget).bytes
     if (answer != "S") return "PostgreSQL at ${config.host}:${config.port} doesn't offer TLS, and sslmode ${config.sslMode} requires it"
     val tls = pgTlsAdded[0]
-    val handle = tls.upgrade(stream.connection, config.host, config.sslMode, config.sslRootCert, config.connectTimeoutMilliseconds)
+    val budget = if (deadline > 0) pgRemaining(deadline,config.connectTimeoutMilliseconds) else config.connectTimeoutMilliseconds
+    if (budget <= 0) return "PostgreSQL TLS connection deadline exceeded"
+    val handle = tls.upgrade(stream.connection, config.host, config.sslMode, config.sslRootCert, budget)
     if (handle == 0) return "TLS with PostgreSQL at ${config.host}:${config.port} failed under sslmode ${config.sslMode}: ${tls.failure()}"
     stream.tls = handle
     ""
@@ -477,7 +540,7 @@ fun pgAuthenticationOffers(body: string, mechanism: string): bool {
     found
 }
 
-fun pgAuthenticate(var stream: PgStream, config: PgConfig): string {
+fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): string {
     var error = ""
     if (stream.connection.descriptor < 0 && stream.tls == 0) {
         error = "Could not connect to PostgreSQL at ${config.host}:${config.port}"
@@ -491,7 +554,7 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig): string {
         var expectedServerSignature = ""
         var scramVerified = false
         while (!ready && error == "") {
-            val message = stream.next(config.readTimeoutMilliseconds)
+            val message = stream.next(config.readTimeoutMilliseconds,deadline)
             if (!message.valid) error = "Timed out during PostgreSQL startup"
             else if (message.kind == 69) error = pgErrorMessage(message.body)
             else if (message.kind == 82) {
@@ -553,7 +616,7 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig): string {
                             val proof = pgScramProof(
                                 config.password,
                                 clientFirstBare,
-                                message.body.slice(4, message.body.size)
+                                message.body.slice(4, message.body.size),"","",deadline
                             )
                             if (proof.error != "") error = proof.error
                             else {
@@ -683,11 +746,36 @@ fun PgClient.connect(): string {
     this.disconnect()
     val problem = pgTlsProblem(this.config)
     if (problem != "") return problem
-    this.stream = pgConnect(this.config)
-    var error = pgTlsNegotiate(this.stream, this.config)
-    if (error == "") error = pgAuthenticate(this.stream, this.config)
-    if (error == "") this.authenticated = true
-    else this.disconnect()
+    if (this.config.targetSessionAttrs != "read-write" && this.config.targetSessionAttrs != "any") return "Unknown PostgreSQL target_session_attrs"
+    val candidates = pgCandidates(this.config)
+    if (candidates.size == 0) return "Invalid PostgreSQL host candidate list (IPv4/DNS host[:port], comma separated)"
+    val deadline = linuxMonotonicMilliseconds()+this.config.connectTimeoutMilliseconds
+    var error = "PostgreSQL connection deadline exceeded"
+    for (index in 0 until candidates.size) {
+        val remaining = pgRemaining(deadline,this.config.connectTimeoutMilliseconds)
+        if (remaining <= 0) break
+        // Reserve a fair part of the one total deadline for later candidates.
+        val attemptDeadline = linuxMonotonicMilliseconds()+remaining/(candidates.size-index)
+        val candidate = pgCandidateConfig(this.config,candidates[index],remaining)
+        val address = pgResolveCandidate(candidate.host,attemptDeadline)
+        val budget = pgRemaining(attemptDeadline,remaining)
+        if (address == "" || budget <= 0) error = "Could not resolve PostgreSQL candidate within connection deadline"
+        else {
+            this.stream = PgStream(tcpConnectIpv4(address,candidate.port,budget),"",0)
+            error = pgTlsNegotiate(this.stream,candidate,attemptDeadline)
+            if (error == "") error = pgAuthenticate(this.stream,candidate,attemptDeadline)
+            if (error == "") {
+                this.authenticated = true
+                if (candidate.targetSessionAttrs == "read-write") {
+                    val ready = this.exchange(pgExtendedQuery("SHOW transaction_read_only",[]),pgRemaining(attemptDeadline,candidate.readTimeoutMilliseconds),0,attemptDeadline)
+                    if (!ready.succeeded || ready.first("transaction_read_only") != "off") error = "PostgreSQL candidate is not a writable target"
+                }
+                if (error == "" && linuxMonotonicMilliseconds() < attemptDeadline) return ""
+                if (error == "") error = "PostgreSQL connection deadline exceeded"
+            }
+            this.disconnect()
+        }
+    }
     error
 }
 
@@ -723,7 +811,7 @@ fun PgClient.script(
     )
 }
 
-private fun PgClient.exchange(request: string, replyTimeout: int, control: int): PgResult {
+private fun PgClient.exchange(request: string, replyTimeout: int, control: int, deadline: int = 0): PgResult {
     val before = this.transactionState
     if (before == pgTransactionLost || before == pgTransactionUnknown) {
         val unknown = before == pgTransactionUnknown
@@ -759,7 +847,7 @@ private fun PgClient.exchange(request: string, replyTimeout: int, control: int):
     // PostgreSQL sends ReadyForQuery after an ordinary SQL error. Drain through
     // it so the persistent connection stays protocol-aligned and reusable.
     while (!ready && !transportFailed) {
-        val message = this.stream.next(replyTimeout)
+        val message = this.stream.next(replyTimeout,deadline)
         if (!message.valid) {
             if (error == "") {
                 error = if (message.kind == pgOversizedMessage) "PostgreSQL sent a single message over 16 MiB: return fewer columns per row, or split the aggregate"

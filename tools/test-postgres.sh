@@ -22,6 +22,8 @@ mkdir -p "$project_dir/build"
     -o "$project_dir/build/transaction-test" --fast --no-cache
 "$compiler" build "$project_dir/tests/async_test.ab" \
     -o "$project_dir/build/async-test" --fast --no-cache
+"$compiler" build "$project_dir/tests/hosts_test.ab" \
+    -o "$project_dir/build/hosts-test" --fast --no-cache
 
 run_mode() {
     mode=$1
@@ -81,6 +83,27 @@ run_mode() {
         POSTGRES_USER=postgres \
         POSTGRES_PASSWORD=definitely-wrong \
             "$project_dir/build/auth-failure-test"
+    fi
+
+    if [ "$mode" = trust ]; then
+        reader="abla-postgres-reader-$$"
+        containers="$containers $reader"
+        docker run -d --rm --name "$reader" -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -e POSTGRES_DB=abla_test -p 127.0.0.1::5432 postgres:16-alpine >/dev/null
+        reader_port=$(docker port "$reader" 5432/tcp | sed 's/.*://')
+        attempt=0
+        until docker exec "$reader" pg_isready -U postgres -d abla_test >/dev/null 2>&1; do
+            attempt=$((attempt+1))
+            if [ "$attempt" -ge 30 ]; then exit 1; fi
+            sleep 1
+        done
+        docker exec "$reader" psql -U postgres -d abla_test -v ON_ERROR_STOP=1 \
+            -c 'ALTER DATABASE abla_test SET default_transaction_read_only=on' >/dev/null
+        POSTGRES_HOST=127.0.0.1 POSTGRES_PORT="$port" POSTGRES_DB=abla_test \
+            POSTGRES_USER=postgres POSTGRES_PASSWORD="$password" PG_TEST_READONLY_PORT="$reader_port" \
+            "$project_dir/build/hosts-test"
+        docker stop "$reader" >/dev/null
+        containers=$(printf '%s' "$containers" | sed "s/ $reader//")
     fi
 
     docker stop "$container" >/dev/null

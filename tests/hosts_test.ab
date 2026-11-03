@@ -1,0 +1,108 @@
+import "../src/postgres.ab"
+import "../src/async.ab"
+import "abla/io"
+import "abla/fs"
+import "abla/process/time"
+
+var checks = 0
+var failures = 0
+fun check(ok: bool, name: string): void {
+    checks = checks+1
+    println("${if(ok) "ok" else "FAIL"} $name")
+    if (!ok) failures=failures+1
+    return
+}
+
+fun answer(var pool: PgPool, id: int): PgResult {
+    val deadline=linuxMonotonicMilliseconds()+10000
+    while(linuxMonotonicMilliseconds()<deadline) {
+        pool.step(5)
+        for(result in pool.takeResults()) if(result.id==id) return result.result
+    }
+    PgResult(false,[],[],"","missing pool result")
+}
+
+fun drip(): int {
+    val parent=pgInt(linuxArgument(1))
+    if (parent<=0 || linuxSyscall5(157,1,9,0,0,0)!=0 || linuxSyscall0(110)!=parent) return 2
+    linuxSyscall1(37,3)
+    val listener=tcpListenAddress(Ipv4SocketAddress("127.0.0.1",0))
+    if(listener.descriptor<0) return 3
+    println("${listener.localPort()}")
+    val stream=PgStream(listener.accept(),"",0)
+    val startup=stream.connection.readWithTimeoutResult(4096,1000).bytes
+    if(startup.size<8) return 4
+    val bytes="${pgTypedMessage(82,[0,0,0,0])}${pgTypedMessage(90,[73])}"
+    for(index in 0 until bytes.size) {
+        if(stream.send(bytes.slice(index,index+1))<0) break
+        sleep(60)
+    }
+    stream.connection.close()
+    0
+}
+
+fun main: int {
+    if(linuxArgument(0)=="drip") return drip()
+    val base=pgConfigFromEnvironment()
+    val reader=pgInt(linuxEnvironment("PG_TEST_READONLY_PORT").value)
+    check(reader>0,"owned read-only stand-in port configured")
+    if(reader<=0) return 1
+    val configured=PgConfig(" 127.0.0.1:1 , 127.0.0.1:$reader , ${base.host}:${base.port} ",base.port,base.database,base.user,base.password,6000,2000)
+    val candidates=pgCandidates(configured)
+    check(candidates.size==3 && candidates[1].port==reader,"trim and parse ordered host:port candidates")
+    check(pgCandidates(PgConfig("localhost:0",5432,"x","x","")).size==0,"invalid explicit port fails closed")
+    check(pgCandidates(PgConfig("localhost,,127.0.0.1",5432,"x","x","")).size==0,"empty candidate fails closed")
+    val bounded=pgConfigWithTimeouts(configured,250,250)
+    check(bounded.host==configured.host && bounded.targetSessionAttrs=="read-write" && bounded.sslMode==configured.sslMode,"budget copy retains candidate and target policy")
+    val unresolved=PgConfig("invalid host name,${base.host}:${base.port}",base.port,base.database,base.user,base.password,6000,2000)
+    val skipped=pgClient(unresolved)
+    check(skipped.query("SELECT 1 AS n").first("n")=="1","sync connector advances past a name the resolver cannot encode")
+    skipped.close()
+    val skippedPool=pgPool(unresolved,PgPoolOptions(1,10000,6000))
+    check(answer(skippedPool,skippedPool.query("SELECT 1 AS n")).first("n")=="1","async connector advances past a resolver failure")
+    skippedPool.drop()
+    val writer=pgClient(base)
+    check(writer.query("DROP TABLE IF EXISTS abla_host_target").succeeded && writer.query("CREATE TABLE abla_host_target(id int PRIMARY KEY)").succeeded,"prepare writer-only relation")
+    val client=pgClient(configured)
+    val first=client.query("INSERT INTO abla_host_target VALUES(1)")
+    check(first.succeeded,"skip refused and read-only candidates before application write")
+    check(writer.query("SELECT count(*)::text AS n FROM abla_host_target").first("n")=="1","write reaches writable candidate exactly once")
+    check(client.query("SET default_transaction_read_only=on").succeeded,"demote this owned writable session")
+    val demoted=client.query("INSERT INTO abla_host_target VALUES(2)")
+    check(!demoted.succeeded && demoted.sqlState=="25006" && !client.authenticated,"read-only error discards current connection without retrying statement")
+    check(writer.query("SELECT count(*)::text AS n FROM abla_host_target").first("n")=="1","demotion does not replay the failed write elsewhere")
+    check(client.query("INSERT INTO abla_host_target VALUES(3)").succeeded,"a later independent operation selects a writable candidate again")
+    check(writer.query("SELECT string_agg(id::text,',' ORDER BY id) AS ids FROM abla_host_target").first("ids")=="1,3","only explicit successful operations are durable")
+    client.close()
+    val pool=pgPool(configured,PgPoolOptions(1,10000,6000))
+    check(answer(pool,pool.query("INSERT INTO abla_host_target VALUES(4)")).succeeded,"async pool skips refused and read-only candidates before dispatch")
+    check(answer(pool,pool.query("SET default_transaction_read_only=on")).succeeded,"demote only the owned async connection")
+    val refused=answer(pool,pool.query("INSERT INTO abla_host_target VALUES(5)"))
+    check(!refused.succeeded && refused.sqlState=="25006","async read-only write fails without replay")
+    check(answer(pool,pool.query("INSERT INTO abla_host_target VALUES(6)")).succeeded,"later async operation selects a writable host")
+    check(writer.query("SELECT string_agg(id::text,',' ORDER BY id) AS ids FROM abla_host_target").first("ids")=="1,3,4,6","async failover preserves exactly the explicit successful writes")
+    pool.drop()
+    writer.query("DROP TABLE abla_host_target")
+    writer.close()
+    val parent=linuxProcessId()
+    val ready="build/host-drip-$parent.ready"
+    val child=linuxCommand("/proc/$parent/exe").argument("drip").argument("$parent").output(ready).start()
+    val deadline=linuxMonotonicMilliseconds()+3000
+    var port=0
+    while(port<=0 && linuxMonotonicMilliseconds()<deadline) { port=pgInt(linuxReadFile(ready,64).trim()); if(port<=0) sleep(5) }
+    check(port>0,"owned dripping-auth server is ready")
+    if(port>0) {
+        val slow=pgClient(PgConfig("127.0.0.1",port,"test","test","",200,2000))
+        val started=linuxMonotonicMilliseconds()
+        val result=slow.query("SELECT 1")
+        val elapsed=linuxMonotonicMilliseconds()-started
+        check(!result.succeeded && elapsed>=150 && elapsed<500,"authentication fragments cannot extend the total 200ms connection deadline ($elapsed ms)")
+        slow.close()
+    }
+    check(linuxWaitProcess(child.process).status==0,"dripping-auth fixture exited and was reaped")
+    Path(ready).remove()
+    val started=linuxMonotonicMilliseconds()
+    check(pgSaltedPassword("synthetic-password","synthetic-salt",1000000,started+30)=="" && linuxMonotonicMilliseconds()-started<150,"SCRAM CPU derivation obeys its deadline too")
+    println("$checks checks, $failures failed")
+    if(failures==0) 0 else 1
+}

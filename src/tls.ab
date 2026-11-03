@@ -35,9 +35,31 @@ trusted fun pgTlsHandshake(var connection: TcpConnection, host: string, mode: st
     if (ready) ready = SSL_set_fd(session, connection.descriptor) == 1
     if (ready) {
         linuxSocketSetTimeouts(connection.descriptor, timeoutMilliseconds, timeoutMilliseconds)
+        ready = linuxSocketSetNonblocking(connection.descriptor,true)
+    }
+    if (ready) {
+        val deadline = linuxMonotonicMilliseconds()+timeoutMilliseconds
         ERR_clear_error()
         val held = linuxBrokenPipeHold()
-        ready = SSL_connect(session) == 1
+        var connected = false
+        var waiting = true
+        while (waiting && linuxMonotonicMilliseconds() < deadline) {
+            val result = SSL_connect(session)
+            if (result == 1) { connected = true; waiting = false }
+            else {
+                val reason = SSL_get_error(session,result)
+                if (reason != 2 && reason != 3) waiting = false
+                else {
+                    val budget = pgRemaining(deadline,timeoutMilliseconds)
+                    if (budget <= 0) waiting = false
+                    else {
+                        val polled = linuxPollSocket(connection.descriptor,reason == 2,reason == 3,budget)
+                        if (polled.timedOut || polled.errorCode != 0 || polled.closed) waiting = false
+                    }
+                }
+            }
+        }
+        ready = connected && linuxSocketSetNonblocking(connection.descriptor,false)
         linuxBrokenPipeRelease(held)
     }
     if (ready && checks) ready = SSL_get_verify_result(session) == 0
@@ -52,6 +74,40 @@ trusted fun pgTlsHandshake(var connection: TcpConnection, host: string, mode: st
     handle
 }
 
+// SSL_read can wait for a whole TLS record even when encrypted bytes arrive a
+// little at a time. Nonblocking reads enforce one deadline across WANT_READ /
+// WANT_WRITE, rather than resetting a socket timeout for each fragment.
+trusted fun pgTlsReceive(handle: int, timeoutMilliseconds: int): string {
+    val descriptor = tlsControlInt(handle,16)
+    if (!linuxSocketSetNonblocking(descriptor,true)) return ""
+    val deadline = linuxMonotonicMilliseconds()+timeoutMilliseconds
+    val session = tlsControlPointer(handle,8)
+    val buffer = nativeByteBuffer(65536)
+    val held = linuxBrokenPipeHold()
+    var measured: int = 0
+    var waiting = true
+    while (waiting && linuxMonotonicMilliseconds() < deadline) {
+        ERR_clear_error()
+        measured = SSL_read(session,buffer.address,65536)
+        if (measured > 0) waiting = false
+        else {
+            val reason = SSL_get_error(session,i32(measured))
+            if (reason != 2 && reason != 3) waiting = false
+            else {
+                val budget = pgRemaining(deadline,timeoutMilliseconds)
+                if (budget <= 0) waiting = false
+                else {
+                    val polled = linuxPollSocket(descriptor,reason == 2,reason == 3,budget)
+                    if (polled.timedOut || polled.errorCode != 0 || polled.closed) waiting = false
+                }
+            }
+        }
+    }
+    linuxSocketSetNonblocking(descriptor,false)
+    linuxBrokenPipeRelease(held)
+    if (measured > 0) buffer.adoptString(measured) else { buffer.close(); "" }
+}
+
 class PgOpenSsl() : PgTls {
     fun upgrade(var connection: TcpConnection, host: string, mode: string, rootCert: string, timeoutMilliseconds: int): int =
         pgTlsHandshake(connection, host, mode, rootCert, timeoutMilliseconds)
@@ -62,13 +118,7 @@ class PgOpenSsl() : PgTls {
         connection.handle = -1
         sent
     }
-    fun receive(handle: int, timeoutMilliseconds: int): string {
-        var connection = TlsConnection(handle)
-        connection.setTimeouts(timeoutMilliseconds, timeoutMilliseconds)
-        val bytes = connection.read(65536)
-        connection.handle = -1
-        bytes
-    }
+    fun receive(handle: int, timeoutMilliseconds: int): string = pgTlsReceive(handle,timeoutMilliseconds)
     fun close(handle: int): void {
         var connection = TlsConnection(handle)
         connection.close()

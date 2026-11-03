@@ -45,6 +45,7 @@ val pgAsyncConnecting = 1
 val pgAsyncAuthenticating = 2
 val pgAsyncIdle = 3
 val pgAsyncBusy = 4
+val pgAsyncChecking = 5
 
 // Operation kinds.
 val pgAsyncQueryOp = 0
@@ -99,7 +100,10 @@ resource class PgPool(
     var scramSaltedPassword: string,
     var connectFailures: int,
     var reconnectAfter: int,
-    val connSqlStates: array<string>
+    val connSqlStates: array<string>,
+    var candidateIndex: int,
+    var selectionDeadline: int,
+    val connCandidates: array<int>
 ) {
     fun drop(): void {
         var slot = 0
@@ -121,7 +125,7 @@ fun pgPool(config: PgConfig, options: PgPoolOptions = PgPoolOptions()): PgPool =
         [], [], [], [], [], [], [],
         [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [],
         [], [],
-        [], [], [], [], 1, 0, "", "", "", 0, 0, []
+        [], [], [], [], 1, 0, "", "", "", 0, 0, [], 0, 0, []
     )
 
 // postgres://user:password@host:port/database (percent-encoded parts allowed).
@@ -331,11 +335,20 @@ fun PgPool.failTransaction(tx: int, error: string): void {
 fun PgPool.closeConnection(slot: int, error: string): void {
     if (slot < 0 || this.connStates[slot] == pgAsyncFree) return
     if (this.connStates[slot] == pgAsyncConnecting ||
-        this.connStates[slot] == pgAsyncAuthenticating) {
+        this.connStates[slot] == pgAsyncAuthenticating || this.connStates[slot] == pgAsyncChecking) {
         // Back off before reconnecting (250 ms doubling to 5 s) so a down or
         // rejecting server fails queued work instead of spinning.
         this.lastConnectError = error
-        this.connectFailures = this.connectFailures + 1
+        val candidates = pgCandidates(this.config)
+        val oldCandidate = this.connCandidates[slot]
+        val superseded = oldCandidate != this.candidateIndex
+        if (oldCandidate == this.candidateIndex) { this.candidateIndex = this.candidateIndex+1; this.address = "" }
+        val another = superseded || (this.candidateIndex < candidates.size && linuxMonotonicMilliseconds() < this.selectionDeadline)
+        if (!another) {
+            this.connectFailures = this.connectFailures + 1
+            this.candidateIndex = 0
+            this.selectionDeadline = 0
+        }
         var backoff = 250
         var doubling = 1
         while (doubling < this.connectFailures && backoff < 5000) {
@@ -343,7 +356,7 @@ fun PgPool.closeConnection(slot: int, error: string): void {
             doubling = doubling + 1
         }
         if (backoff > 5000) backoff = 5000
-        this.reconnectAfter = linuxMonotonicMilliseconds() + backoff
+        this.reconnectAfter = if (another) 0 else linuxMonotonicMilliseconds() + backoff
     }
     val descriptor = this.connDescriptors[slot]
     if (descriptor >= 0) {
@@ -407,15 +420,33 @@ fun PgPool.openConnection(): int {
         this.lastConnectError = "The async pool has no TLS: sslmode ${this.config.sslMode} is only for PgClient and pgQuery"
         return -1
     }
-    if (this.address == "") this.address = pgAsyncResolve(this.config.host)
-    if (this.address == "") {
-        this.lastConnectError = "Could not resolve PostgreSQL host ${this.config.host}"
+    val candidates = pgCandidates(this.config)
+    if (candidates.size == 0 || (this.config.targetSessionAttrs != "any" && this.config.targetSessionAttrs != "read-write")) {
+        this.lastConnectError = "Invalid PostgreSQL candidates or target_session_attrs"
         return -1
     }
-    val descriptor = pgAsyncConnect(this.address, this.config.port)
+    if (this.candidateIndex >= candidates.size) this.candidateIndex = 0
+    val connectBudget = if (this.config.connectTimeoutMilliseconds < this.options.connectTimeoutMilliseconds) this.config.connectTimeoutMilliseconds else this.options.connectTimeoutMilliseconds
+    if (this.selectionDeadline == 0) this.selectionDeadline = linuxMonotonicMilliseconds()+connectBudget
+    var descriptor = -1
+    var deadline = 0
+    while (descriptor < 0 && this.candidateIndex < candidates.size) {
+        val remaining = pgRemaining(this.selectionDeadline,connectBudget)
+        if (remaining <= 0) { this.lastConnectError = "PostgreSQL candidate selection deadline exceeded"; break }
+        deadline = linuxMonotonicMilliseconds()+remaining/(candidates.size-this.candidateIndex)
+        val candidate = candidates[this.candidateIndex]
+        if (this.address == "") this.address = pgResolveCandidate(candidate.host,deadline)
+        if (this.address == "" || pgRemaining(deadline,connectBudget) <= 0) this.lastConnectError = "Could not resolve PostgreSQL candidate within connection deadline"
+        else {
+            descriptor = pgAsyncConnect(this.address,candidate.port)
+            if (descriptor < 0) this.lastConnectError = "Could not connect to PostgreSQL (errno ${-descriptor})"
+        }
+        if (descriptor < 0) { this.candidateIndex = this.candidateIndex+1; this.address = "" }
+    }
     if (descriptor < 0) {
-        this.lastConnectError = "Could not connect to PostgreSQL (errno ${-descriptor})"
         this.address = ""
+        this.selectionDeadline = 0
+        this.candidateIndex = 0
         return -1
     }
     var slot = -1
@@ -445,6 +476,7 @@ fun PgPool.openConnection(): int {
         this.connCommands.append("")
         this.connErrors.append("")
         this.connSqlStates.append("")
+        this.connCandidates.append(0)
     }
     this.connDescriptors[slot] = descriptor
     this.connStates[slot] = pgAsyncConnecting
@@ -453,8 +485,8 @@ fun PgPool.openConnection(): int {
     this.connOutputOffsets[slot] = 0
     this.connOps[slot] = -1
     this.connTransactions[slot] = 0
-    this.connDeadlines[slot] = linuxMonotonicMilliseconds() +
-        this.options.connectTimeoutMilliseconds
+    this.connDeadlines[slot] = deadline
+    this.connCandidates[slot] = this.candidateIndex
     this.connClientFirst[slot] = ""
     this.connServerSignature[slot] = ""
     this.connScramVerified[slot] = false
@@ -506,7 +538,7 @@ fun PgPool.handleAuthentication(slot: int, kind: int, body: string): void {
             // the PBKDF2 derivation runs once per pool, not once per session.
             val proof = pgScramProof(
                 this.config.password, this.connClientFirst[slot], body.slice(4, body.size),
-                this.scramSaltKey, this.scramSaltedPassword
+                this.scramSaltKey, this.scramSaltedPassword,this.connDeadlines[slot]
             )
             if (proof.error != "") this.closeConnection(slot, proof.error)
             else {
@@ -533,10 +565,36 @@ fun PgPool.handleAuthentication(slot: int, kind: int, body: string): void {
         } else if (body.size != 1 || body[0] != 73) {
             this.closeConnection(slot,"PostgreSQL startup did not finish in idle transaction state")
         } else {
-            this.connStates[slot] = pgAsyncIdle
-            this.lastConnectError = ""
-            this.connectFailures = 0
+            if (this.config.targetSessionAttrs == "read-write") {
+                this.connStates[slot] = pgAsyncChecking
+                this.connColumns[slot] = []
+                this.connRows[slot] = []
+                this.connErrors[slot] = ""
+                this.queueOutput(slot,pgExtendedQuery("SHOW transaction_read_only",[]))
+            } else this.targetReady(slot)
         }
+    }
+    return
+}
+
+fun PgPool.targetReady(slot: int): void {
+    this.connStates[slot] = pgAsyncIdle
+    this.lastConnectError = ""
+    this.connectFailures = 0
+    this.selectionDeadline = 0
+    this.candidateIndex = this.connCandidates[slot]
+    return
+}
+
+fun PgPool.handleTarget(slot: int, kind: int, body: string): void {
+    if (kind == 69) this.connErrors[slot] = pgErrorMessage(body)
+    else if (kind == 68) this.connRows[slot].append(pgParseRow(body))
+    else if (kind == 90) {
+        val rows = this.connRows[slot]
+        val writable = this.connErrors[slot] == "" && body.size == 1 && body[0] == 73 && rows.size == 1 && rows[0].size == 1 && !rows[0][0].isNull && rows[0][0].value == "off"
+        this.connRows[slot] = []
+        if (writable) this.targetReady(slot)
+        else this.closeConnection(slot,"PostgreSQL candidate is not a writable target")
     }
     return
 }
@@ -595,7 +653,11 @@ fun PgPool.handleQueryMessage(slot: int, kind: int, body: string): void {
                 this.failTransaction(tx,"transaction ended outside the pool commit/rollback API")
             }
         }
-        if (sqlState == "25006" || sqlState == "57P01" || sqlState == "57P02" || sqlState == "57P03" || sqlState.startsWith("08")) this.closeConnection(slot,"PostgreSQL server session is no longer usable")
+        if (sqlState == "25006" || sqlState == "57P01" || sqlState == "57P02" || sqlState == "57P03" || sqlState.startsWith("08")) {
+            this.candidateIndex = this.connCandidates[slot]+1
+            this.address = ""
+            this.closeConnection(slot,"PostgreSQL server session is no longer usable")
+        }
     }
     return
 }
@@ -623,6 +685,8 @@ fun PgPool.readReady(slot: int): void {
                     offset = offset + total
                     if (this.connStates[slot] == pgAsyncAuthenticating) {
                         this.handleAuthentication(slot, kind, body)
+                    } else if (this.connStates[slot] == pgAsyncChecking) {
+                        this.handleTarget(slot,kind,body)
                     } else if (this.connStates[slot] == pgAsyncBusy) {
                         this.handleQueryMessage(slot, kind, body)
                     }
@@ -727,7 +791,7 @@ fun PgPool.dispatch(): void {
     var slot = 0
     while (slot < this.connStates.size) {
         if (this.connStates[slot] == pgAsyncConnecting ||
-            this.connStates[slot] == pgAsyncAuthenticating) opening = opening + 1
+            this.connStates[slot] == pgAsyncAuthenticating || this.connStates[slot] == pgAsyncChecking) opening = opening + 1
         slot = slot + 1
     }
     var live = this.liveConnections()
@@ -798,7 +862,7 @@ fun PgPool.sweep(now: int): void {
     var slot = 0
     while (slot < this.connStates.size) {
         if ((this.connStates[slot] == pgAsyncConnecting ||
-            this.connStates[slot] == pgAsyncAuthenticating) && now >= this.connDeadlines[slot]) {
+            this.connStates[slot] == pgAsyncAuthenticating || this.connStates[slot] == pgAsyncChecking) && now >= this.connDeadlines[slot]) {
             this.lastConnectError = "Timed out connecting to PostgreSQL"
             this.address = ""
             this.closeConnection(slot, this.lastConnectError)

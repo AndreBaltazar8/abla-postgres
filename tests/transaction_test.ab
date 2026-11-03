@@ -82,7 +82,7 @@ fun lostBeginChecks(): void {
     }
     check(port>0,"owned wire fixture ready")
     if (port>0) {
-        val client=pgClient(PgConfig("127.0.0.1",port,"test","test","",300,300))
+        val client=pgClient(PgConfig("127.0.0.1",port,"test","test","",300,300,"disable","","any"))
         val begin=client.query("\x0b\x0c-- comment ending with CR\rBEGIN")
         check(!begin.succeeded && client.transactionState==pgTransactionLost,"lost BEGIN acknowledgement still poisons transaction")
         check(!client.query("SELECT 1").succeeded && client.transactionState==pgTransactionLost,"no reconnect after lost BEGIN reply")
@@ -108,7 +108,7 @@ fun asyncCommitReplyChecks(): void {
     }
     check(port>0,"owned commit wire fixture ready")
     if (port>0) {
-        val pool=pgPool(PgConfig("127.0.0.1",port,"test","test","",300,300),PgPoolOptions(1,1000,500))
+        val pool=pgPool(PgConfig("127.0.0.1",port,"test","test","",300,300,"disable","","any"),PgPoolOptions(1,1000,500))
         val tx=pool.begin()
         val commit=pool.commit(tx)
         val results=drain(pool,2)
@@ -137,7 +137,7 @@ fun bridgeCommitReplyChecks(): void {
     }
     check(port>0,"owned bridge commit fixture ready")
     if (port>0) {
-        val config=PgConfig("127.0.0.1",port,"test","test","",300,300)
+        val config=PgConfig("127.0.0.1",port,"test","test","",300,300,"disable","","any")
         val begin=pgSessionQuery(config,PgSessionState(),"BEGIN")
         check(begin.result.succeeded && begin.state.transactionState==pgTransactionOpen,"bridge BEGIN acknowledged")
         val commit=pgSessionQuery(config,begin.state,"COMMIT")

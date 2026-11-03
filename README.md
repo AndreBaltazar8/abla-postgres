@@ -1,5 +1,15 @@
 # Abla Postgres
 
+`POSTGRES_HOST` accepts ordered comma-separated IPv4/DNS candidates, with an
+optional `:port` per candidate (otherwise `POSTGRES_PORT`). Authentication,
+TLS, and a writable-target probe share one connect deadline across candidates;
+`POSTGRES_TARGET_SESSION_ATTRS=any` explicitly permits read-only connections.
+The default is `read-write`. A `25006` read-only error discards that session and
+fails the operation; a later independent operation can select a writer. No SQL
+is replayed during failover. `pgConfigWithTimeouts` retains this policy when
+giving a checkpoint connection a separate budget. The bounded connector uses
+IPv4/DNS and `/etc/hosts`, without invoking arbitrary blocking NSS resolvers.
+
 Abla Postgres is a PostgreSQL client written in
 [Abla](https://github.com/AndreBaltazar8/ablac) for Abla Linux services. It
 speaks the PostgreSQL v3 wire protocol directly, so applications do not need

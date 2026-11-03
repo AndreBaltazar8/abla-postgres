@@ -3,6 +3,24 @@
 
 import "abla/crypto"
 import "abla/sys/linux"
+import "abla/process/time"
+
+// SCRAM derivation is CPU work too: a hostile iteration count must not escape
+// the connection's total deadline while no socket is being read.
+fun pgSaltedPassword(password: string, salt: string, iterations: int, deadline: int): string {
+    if (deadline <= 0) return pbkdf2Sha256(password,salt,iterations)
+    if (iterations <= 0 || iterations > 1000000 || monotonicMilliseconds() >= deadline) return ""
+    var current = hmacSha256(password,"${salt}\x00\x00\x00\x01")
+    var result = current
+    var iteration = 1
+    while (iteration < iterations) {
+        if (iteration % 8 == 0 && monotonicMilliseconds() >= deadline) return ""
+        current = hmacSha256(password,current)
+        result = binaryXor(result,current)
+        iteration = iteration + 1
+    }
+    if (monotonicMilliseconds() >= deadline) "" else result
+}
 
 fun pgSecureNonce(): string {
     val random = linuxReadFile("/dev/urandom", 18)
@@ -81,7 +99,8 @@ fun pgScramProof(
     clientFirstBare: string,
     serverFirst: string,
     cachedSaltKey: string = "",
-    cachedSaltedPassword: string = ""
+    cachedSaltedPassword: string = "",
+    deadline: int = 0
 ): PgScramProof {
     var error = ""
     val clientNonce = pgScramAttribute(clientFirstBare, 114)
@@ -108,7 +127,8 @@ fun pgScramProof(
         val withoutProof = "c=biws,r=$serverNonce"
         val authMessage = "$clientFirstBare,$serverFirst,$withoutProof"
         saltedPassword = if (cachedSaltKey == saltKey && cachedSaltedPassword != "")
-            cachedSaltedPassword else pbkdf2Sha256(password, salt, iterations)
+            cachedSaltedPassword else pgSaltedPassword(password, salt, iterations,deadline)
+        if (saltedPassword == "" || (deadline > 0 && monotonicMilliseconds() >= deadline)) return PgScramProof("","","PostgreSQL SCRAM exceeded connection deadline","","")
         val clientKey = hmacSha256(saltedPassword, "Client Key")
         val storedKey = sha256(clientKey)
         val clientSignature = hmacSha256(storedKey, authMessage)
