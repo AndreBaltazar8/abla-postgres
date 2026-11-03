@@ -1,0 +1,245 @@
+import "../src/postgres.ab"
+import "../src/async.ab"
+import "abla/io"
+import "abla/fs"
+import "abla/sys/linux"
+import "abla/process/time"
+
+var failures = 0
+var checks = 0
+fun check(ok: bool, name: string): void {
+    checks = checks + 1
+    println("${if (ok) "ok" else "FAIL"} $name")
+    if (!ok) failures = failures + 1
+    return
+}
+
+fun drain(var pool: PgPool, count: int): array<PgAsyncResult> {
+    val results: array<PgAsyncResult> = []
+    val deadline=linuxMonotonicMilliseconds()+10000
+    while (results.size<count && linuxMonotonicMilliseconds()<deadline) {
+        pool.step(5)
+        for (result in pool.takeResults()) results.append(result)
+    }
+    results
+}
+
+fun resultOf(results: array<PgAsyncResult>, id: int): PgResult {
+    for (result in results) if (result.id==id) return result.result
+    PgResult(false,[],[],"","missing async result")
+}
+
+fun lostBeginServer(): int {
+    val parent=pgInt(linuxArgument(1))
+    if (parent<=0 || linuxSyscall5(157,1,9,0,0,0)!=0 || linuxSyscall0(110)!=parent) return 2
+    linuxSyscall1(37,3)
+    val listener=tcpListenAddress(Ipv4SocketAddress("127.0.0.1",0))
+    if (listener.descriptor<0) return 3
+    println("${listener.localPort()}")
+    val stream=PgStream(listener.accept(),"",0)
+    var startup=""
+    while (startup.size<4) {
+        val got=stream.connection.readWithTimeoutResult(4096,1000).bytes
+        if (got=="") return 4
+        startup="$startup$got"
+    }
+    val size=pgReadU32(startup,0)
+    if (size<8 || size>4096) return 5
+    while (startup.size<size) {
+        val got=stream.connection.readWithTimeoutResult(4096,1000).bytes
+        if (got=="") return 6
+        startup="$startup$got"
+    }
+    stream.buffered=startup.slice(size,startup.size)
+    stream.send("${pgTypedMessage(82,[0,0,0,0])}${pgTypedMessage(90,[73])}")
+    val commit=linuxArgument(0)=="lost-commit"
+    for (statement in 0 until (if (commit) 2 else 1)) {
+        var synced=false
+        while (!synced) {
+            val message=stream.next(1000)
+            if (!message.valid) return 7
+            synced=message.kind==83
+        }
+        if (commit && statement==0) stream.send("${pgTypedMessage(67,[66,69,71,73,78,0])}${pgTypedMessage(90,[84])}")
+    }
+    // BEGIN ran, but ReadyForQuery(T) is lost. A client tracking only the last
+    // acknowledged state would incorrectly regard itself as idle here.
+    stream.send(if (commit) pgTypedMessage(67,[67,79,77,77,73,84,0]) else pgTypedMessage(67,[66,69,71,73,78,0]))
+    stream.connection.close()
+    0
+}
+
+fun lostBeginChecks(): void {
+    val parent=linuxProcessId()
+    val ready="build/lost-begin-$parent.ready"
+    val child=linuxCommand("/proc/$parent/exe").argument("lost-begin").argument("$parent").output(ready).start()
+    if (child.process<=0) { check(false,"wire fixture launched"); return }
+    val deadline=linuxMonotonicMilliseconds()+3000
+    var port=0
+    while (port<=0 && linuxMonotonicMilliseconds()<deadline) {
+        port=pgInt(linuxReadFile(ready,64).trim())
+        if (port<=0) sleep(10)
+    }
+    check(port>0,"owned wire fixture ready")
+    if (port>0) {
+        val client=pgClient(PgConfig("127.0.0.1",port,"test","test","",300,300))
+        val begin=client.query("BEGIN")
+        check(!begin.succeeded && client.transactionState==pgTransactionLost,"lost BEGIN acknowledgement still poisons transaction")
+        check(!client.query("SELECT 1").succeeded && client.transactionState==pgTransactionLost,"no reconnect after lost BEGIN reply")
+        check(client.query("ROLLBACK").succeeded,"lost BEGIN can be reset explicitly")
+        client.close()
+    }
+    check(linuxWaitProcess(child.process).status==0,"wire fixture exited and reaped")
+    Path(ready).remove()
+    return
+}
+
+fun asyncCommitReplyChecks(): void {
+    val parent=linuxProcessId()
+    val ready="build/lost-commit-$parent.ready"
+    val child=linuxCommand("/proc/$parent/exe").argument("lost-commit").argument("$parent").output(ready).start()
+    if (child.process<=0) { check(false,"commit fixture launched"); return }
+    val deadline=linuxMonotonicMilliseconds()+3000
+    var port=0
+    while (port<=0 && linuxMonotonicMilliseconds()<deadline) {
+        port=pgInt(linuxReadFile(ready,64).trim())
+        if (port<=0) sleep(10)
+    }
+    check(port>0,"owned commit wire fixture ready")
+    if (port>0) {
+        val pool=pgPool(PgConfig("127.0.0.1",port,"test","test","",300,300),PgPoolOptions(1,1000,500))
+        val tx=pool.begin()
+        val commit=pool.commit(tx)
+        val results=drain(pool,2)
+        check(results.size==2 && resultOf(results,tx).succeeded,"async BEGIN acknowledged before commit")
+        val outcome=resultOf(results,commit)
+        check(!outcome.succeeded && outcome.outcomeUnknown,"active async COMMIT loss is unknown")
+        val later=pool.execute("INSERT INTO not_replayed VALUES(1)",[],tx)
+        check(!resultOf(drain(pool,1),later).succeeded,"async transaction ID cannot be revived")
+        pool.drop()
+    }
+    check(linuxWaitProcess(child.process).status==0,"commit wire fixture exited and reaped")
+    Path(ready).remove()
+    return
+}
+
+fun bridgeCommitReplyChecks(): void {
+    val parent=linuxProcessId()
+    val ready="build/bridge-commit-$parent.ready"
+    val child=linuxCommand("/proc/$parent/exe").argument("lost-commit").argument("$parent").output(ready).start()
+    if (child.process<=0) { check(false,"bridge commit fixture launched"); return }
+    val deadline=linuxMonotonicMilliseconds()+3000
+    var port=0
+    while (port<=0 && linuxMonotonicMilliseconds()<deadline) {
+        port=pgInt(linuxReadFile(ready,64).trim())
+        if (port<=0) sleep(10)
+    }
+    check(port>0,"owned bridge commit fixture ready")
+    if (port>0) {
+        val config=PgConfig("127.0.0.1",port,"test","test","",300,300)
+        val begin=pgSessionQuery(config,PgSessionState(),"BEGIN")
+        check(begin.result.succeeded && begin.state.transactionState==pgTransactionOpen,"bridge BEGIN acknowledged")
+        val commit=pgSessionQuery(config,begin.state,"COMMIT")
+        check(!commit.result.succeeded && commit.result.outcomeUnknown && commit.state.transactionState==pgTransactionUnknown,"bridge COMMIT reply loss carries unknown outcome")
+        val later=pgSessionQuery(config,commit.state,"SELECT 1")
+        check(!later.result.succeeded && later.result.outcomeUnknown,"bridge retains unknown outcome across later calls")
+        val reset=pgSessionQuery(config,later.state,"ROLLBACK")
+        check(!reset.result.succeeded && reset.result.outcomeUnknown && reset.state.transactionState==pgTransactionIdle,"bridge reset does not claim rollback of unknown COMMIT")
+    }
+    check(linuxWaitProcess(child.process).status==0,"bridge commit fixture exited and reaped")
+    Path(ready).remove()
+    return
+}
+
+fun main: int {
+    if (linuxArgument(0)=="lost-begin" || linuxArgument(0)=="lost-commit") return lostBeginServer()
+    lostBeginChecks()
+    asyncCommitReplyChecks()
+    bridgeCommitReplyChecks()
+    val config = pgConfigFromEnvironment()
+    val admin = pgClient(config)
+    check(admin.script("CREATE TABLE IF NOT EXISTS abla_transaction_safety(id int PRIMARY KEY); DELETE FROM abla_transaction_safety").succeeded,"private fixture table")
+    val client = pgClient(config)
+    val pid = client.query("SELECT pg_backend_pid()::text AS pid,set_config('application_name','abla-transaction-owned',false)").first("pid")
+    check(pid != "","own backend identified")
+    check(client.query("/* nested /* COMMIT */ comment */ -- BEGIN\n BEGIN").succeeded && client.transactionState == pgTransactionOpen,"BEGIN state includes comments")
+    check(client.connect()!="" && client.query("SELECT pg_backend_pid()::text AS pid").first("pid")==pid,"explicit reconnect refuses to abandon a live transaction")
+    check(client.execute("INSERT INTO abla_transaction_safety VALUES(1)").succeeded,"uncommitted write")
+    val killed = admin.query("SELECT pg_terminate_backend(pid)::text AS killed FROM pg_stat_activity WHERE pid=$1::int AND application_name='abla-transaction-owned'",[pgText(pid)])
+    check(killed.first("killed") == "true","only the identified test backend terminated")
+    val lost = client.execute("INSERT INTO abla_transaction_safety VALUES(2)")
+    check(!lost.succeeded && client.transactionState == pgTransactionLost,"transport loss poisons open transaction")
+    check(!client.execute("INSERT INTO abla_transaction_safety VALUES(3)").succeeded,"later write cannot reconnect outside BEGIN")
+    check(!client.query("COMMIT").succeeded,"lost transaction cannot report committed")
+    check(admin.query("SELECT count(*)::text AS n FROM abla_transaction_safety").first("n") == "0","no uncommitted or later autocommitted rows")
+    check(client.query("ROLLBACK").succeeded && client.transactionState == pgTransactionIdle,"explicit rollback resets lost client")
+    check(client.execute("INSERT INTO abla_transaction_safety VALUES(4)").succeeded,"new operation after reset reconnects")
+
+    check(client.query("BEGIN").succeeded,"new transaction")
+    check(client.execute("INSERT INTO abla_transaction_safety VALUES(5)").succeeded,"write before SQL failure")
+    val duplicate = client.execute("INSERT INTO abla_transaction_safety VALUES(4)")
+    check(!duplicate.succeeded && duplicate.sqlState == "23505" && client.transactionState == pgTransactionFailed,"server SQLSTATE and failed transaction retained")
+    val aborted = client.query("COMMIT")
+    check(!aborted.succeeded && aborted.command == "ROLLBACK" && aborted.sqlState == "25P02","aborted COMMIT is a failure, not silent success")
+    check(admin.query("SELECT count(*)::text AS n FROM abla_transaction_safety WHERE id=5").first("n") == "0","failed transaction rolled back")
+
+    var state = PgSessionState()
+    val named = pgSessionQuery(config,state,"SELECT pg_backend_pid()::text AS pid,set_config('application_name','abla-bridge-owned',false)")
+    state = named.state
+    val begun = pgSessionQuery(config,state,"START TRANSACTION")
+    state = begun.state
+    check(begun.result.succeeded && state.transactionState == pgTransactionOpen,"value-shaped bridge carries transaction state")
+    val written = pgSessionQuery(config,state,"INSERT INTO abla_transaction_safety VALUES(6)")
+    state = written.state
+    check(written.result.succeeded,"bridge uncommitted write")
+    check(admin.query("SELECT pg_terminate_backend(pid)::text AS killed FROM pg_stat_activity WHERE pid=$1::int AND application_name='abla-bridge-owned'",[pgText(named.result.first("pid"))]).first("killed") == "true","identified bridge backend terminated")
+    val bridgeLost = pgSessionQuery(config,state,"SELECT 1")
+    val refused = pgSessionQuery(config,bridgeLost.state,"INSERT INTO abla_transaction_safety VALUES(7)")
+    check(!bridgeLost.result.succeeded && !refused.result.succeeded && refused.state.transactionState == pgTransactionLost,"bridge cannot forget disconnected transaction")
+    check(admin.query("SELECT count(*)::text AS n FROM abla_transaction_safety WHERE id IN(6,7)").first("n") == "0","bridge never resumes outside BEGIN")
+    check(pgSessionQuery(config,refused.state,"ROLLBACK").result.succeeded,"bridge explicit reset")
+
+    // PostgreSQL commits the row, then drops the connection before the batch's
+    // ReadyForQuery. The client must report ambiguity even though the DB proves
+    // the write persisted; ROLLBACK cannot turn that into an assumed rollback.
+    check(client.query("BEGIN").succeeded,"transaction before lost COMMIT acknowledgement")
+    check(client.execute("INSERT INTO abla_transaction_safety VALUES(8)").succeeded,"write before lost COMMIT acknowledgement")
+    val ambiguous = client.script("COMMIT; SELECT pg_terminate_backend(pg_backend_pid())")
+    check(!ambiguous.succeeded && ambiguous.outcomeUnknown && client.transactionState == pgTransactionUnknown,"lost COMMIT reply is an explicit unknown outcome")
+    check(admin.query("SELECT count(*)::text AS n FROM abla_transaction_safety WHERE id=8").first("n") == "1","COMMIT actually persisted despite lost complete reply")
+    check(!client.execute("INSERT INTO abla_transaction_safety VALUES(9)").succeeded,"unknown transaction blocks later operations")
+    val reset = client.query("ROLLBACK")
+    check(!reset.succeeded && reset.outcomeUnknown && client.transactionState == pgTransactionIdle,"reset never claims an unknown COMMIT rolled back")
+    check(client.query("SELECT 1").succeeded,"explicit reset permits a new operation")
+
+    // SCRAM computes a password proof; use the pool's normal connect budget,
+    // rather than the short no-authentication wire stand-in's 500ms budget.
+    val pool=pgPool(config,PgPoolOptions(2,5000,5000))
+    val tx=pool.begin()
+    val identified=pool.query("SELECT pg_backend_pid()::text AS pid,set_config('application_name','abla-async-owned',false)",[],tx)
+    val write=pool.execute("INSERT INTO abla_transaction_safety VALUES(10)",[],tx)
+    val prepared=drain(pool,3)
+    for (result in prepared) if (!result.result.succeeded) println("async preparation id=${result.id} elapsed=${result.elapsedMilliseconds} error=${result.result.error}")
+    check(prepared.size==3 && resultOf(prepared,tx).succeeded && resultOf(prepared,write).succeeded,"async transaction and write prepared")
+    val poolPid=resultOf(prepared,identified).first("pid")
+    check(admin.query("SELECT pg_terminate_backend(pid)::text AS killed FROM pg_stat_activity WHERE pid=$1::int AND application_name='abla-async-owned'",[pgText(poolPid)]).first("killed")=="true","identified async backend terminated")
+    val first=pool.execute("INSERT INTO abla_transaction_safety VALUES(11)",[],tx)
+    val later=pool.execute("INSERT INTO abla_transaction_safety VALUES(12)",[],tx)
+    val end=pool.commit(tx)
+    val failed=drain(pool,3)
+    check(failed.size==3 && !resultOf(failed,first).succeeded && !resultOf(failed,later).succeeded && !resultOf(failed,end).succeeded,"async active and queued transaction work all fail")
+    check(!resultOf(failed,end).outcomeUnknown,"queued unsent COMMIT does not claim ambiguity")
+    check(admin.query("SELECT count(*)::text AS n FROM abla_transaction_safety WHERE id IN(10,11,12)").first("n")=="0","async connection loss never autocommits queued writes")
+    val abortedTx=pool.begin()
+    val bad=pool.execute("INSERT INTO abla_transaction_safety VALUES(4)",[],abortedTx)
+    val abortCommit=pool.commit(abortedTx)
+    val abortedResults=drain(pool,3)
+    for (result in abortedResults) if (!result.result.succeeded) println("async aborted id=${result.id} elapsed=${result.elapsedMilliseconds} state=${result.result.sqlState} error=${result.result.error}")
+    check(resultOf(abortedResults,bad).sqlState=="23505","async SQLSTATE preserved")
+    check(!resultOf(abortedResults,abortCommit).succeeded && resultOf(abortedResults,abortCommit).sqlState=="25P02","async aborted COMMIT is not success")
+    pool.drop()
+    client.close()
+    admin.close()
+    println("$checks checks, $failures failed")
+    if (failures == 0) 0 else 1
+}

@@ -12,8 +12,8 @@ fun main: int {
         return 1
     }
     // The session bridge, as a long-running service keeps it.
-    val first = pgSessionQuery(config, -1, "", "SELECT 1::text AS one")
-    val second = pgSessionQuery(config, first.descriptor, first.buffered, "SELECT 2::text AS two")
+    val first = pgSessionQuery(config, PgSessionState(), "SELECT 1::text AS one")
+    val second = pgSessionQuery(config, first.state, "SELECT 2::text AS two")
     if (second.result.first("two") != "2") {
         println("the session broke: ${second.result.error}")
         return 1

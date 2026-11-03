@@ -30,9 +30,19 @@ silently treating it as success.
 `PgClient` performs startup and authentication lazily, then sends subsequent
 extended queries over the same socket. Error responses are drained until
 `ReadyForQuery`, keeping the stream aligned. A write failure, timeout, or
-truncated frame invalidates the session; the next query establishes and
-authenticates a new connection. `pgSessionQuery` exposes the same behavior as
-scalar descriptor/buffer state for Abla servers whose state is global.
+truncated frame invalidates the socket. Idle sessions can reconnect for a later
+operation, but an explicit transaction stays fenced until rollback or explicit
+reset. BEGIN is marked before transmission, so losing its acknowledgement cannot
+make later writes autocommit. `ReadyForQuery`'s I/T/E body updates logical state;
+an aborted COMMIT returning a ROLLBACK tag is a failed commit.
+
+`ErrorResponse` SQLSTATE is returned separately from its message/detail. A lost
+COMMIT acknowledgement is an unknown outcome, not an assumed rollback, and no
+statement is replayed. The same applies conservatively to interrupted scripts.
+`pgSessionQuery` requires a `PgSessionState` containing descriptor, buffer and
+logical transaction state; every result returns its replacement state. The
+asynchronous pool also invalidates a lost transaction's queued work and ID, and
+distinguishes an active uncertain COMMIT from a queued unsent one.
 
 SCRAM nonces come from `/dev/urandom`. The client validates the server nonce
 prefix, Base64 salt, a bounded iteration count, and the final server signature.

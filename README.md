@@ -12,7 +12,8 @@ The current release includes:
 - named, nullable result cells;
 - connection and read timeouts;
 - reusable authenticated sessions for low-latency services;
-- PostgreSQL server error propagation;
+- PostgreSQL server errors, SQLSTATE and explicit uncertain commit outcomes;
+- transaction state retained across transport failures, including the session bridge;
 - trust, cleartext password, MD5 challenge-response, and SCRAM-SHA-256
   authentication;
 - RFC-compatible SHA-256/HMAC/PBKDF2 proofs from `abla/crypto`, with server-signature
@@ -71,7 +72,8 @@ waits for the next bytes of a reply, so a query that takes longer than it fails
 unless the query gives its own: `client.query(sql, parameters, 60000)`, and
 likewise as the last argument of `execute`, `pgQuery`, `pgExecute`,
 `pgSessionQuery` and, on a pool, `query` and `execute`. A query that runs out
-loses its connection, and the next query opens another. PostgreSQL may keep
+loses its connection. Outside an explicit transaction, the next operation can open
+another; statements are never automatically replayed. PostgreSQL may keep
 working on it, so set `statement_timeout` where that matters. A single message
 over 16 MiB is refused with an error that says so, and also loses its connection.
 
@@ -105,10 +107,49 @@ authenticates lazily on the first query and reuses that connection until
 `pgExecute(config, ...)` remain convenient one-shot calls.
 
 Abla deliberately prevents mutable borrowing of a managed global. Servers that
-need a process-wide session can retain an integer descriptor and buffered
-string, then pass them through `pgSessionQuery(...)`; its `PgSessionResult`
-returns the updated scalar state together with the query result. The Mimo demo
-uses this form because its HTTP dispatcher is serial.
+need a process-wide session retain an immutable `PgSessionState` and replace it
+with each returned state:
+
+```abla
+val first = pgSessionQuery(config, PgSessionState(), "BEGIN")
+val written = pgSessionQuery(config, first.state, "UPDATE items SET ready=true")
+val ended = pgSessionQuery(config, written.state, "COMMIT")
+```
+
+The bridge now requires the complete state instead of separate descriptor and
+buffer arguments. Check every result before proceeding or reporting success.
+Migrate existing callers to retain `reply.state`, including on
+failure. It contains `descriptor`, `buffered`, and `transactionState`; retaining
+only the socket loses the distinction between a fresh session and a disconnected
+transaction. A server can also retain these three scalar fields separately and
+construct the next `PgSessionState` from them.
+
+### Transaction loss and uncertain outcomes
+
+`BEGIN`/`START TRANSACTION` and PostgreSQL's `ReadyForQuery` transaction state
+are tracked. Losing the connection during an open transaction, or before BEGIN
+is fully acknowledged, makes later statements and COMMIT fail without opening a
+replacement connection. Explicit `ROLLBACK` or `client.close()` resets that
+logical session; a bridge caller must carry the reset's returned state. Calling
+`connect()` cannot silently abandon a live transaction.
+
+Always check COMMIT's result. PostgreSQL reports an aborted transaction's COMMIT
+as a `ROLLBACK` command; the client returns `succeeded=false` and SQLSTATE `25P02`
+for that case. Ordinary SQL errors retain their server SQLSTATE and drain the
+protocol so rollback remains possible.
+
+If a COMMIT acknowledgement is lost, `result.outcomeUnknown` is true. The write
+may have committed: resolve it using application idempotency or a durable
+operation identity before retrying. A subsequent local ROLLBACK resets the
+disconnected client but returns failure with `outcomeUnknown=true`; it does not
+claim the original commit rolled back. An interrupted simple-query script is
+conservative for the same reason. An interrupted autocommitted request can also
+have an unknown outcome, even though a later independent operation may reconnect.
+
+The asynchronous pool follows the same rule: a running COMMIT with a lost reply
+is uncertain, while an unsent queued COMMIT is not. A failed transaction's queued
+operations fail together, and its transaction ID cannot be revived on a different
+connection. Neither client replays database statements automatically.
 
 Use `pgNull()` for a SQL null value:
 
@@ -122,7 +163,7 @@ val result = pgExecute(
 
 Useful result APIs are:
 
-- `result.succeeded`, `result.error`, and `result.command`;
+- `result.succeeded`, `result.error`, `result.sqlState`, `result.command`, and `result.outcomeUnknown`;
 - `result.columns` and `result.rows`;
 - `result.first("column")` for the first non-null string value; and
 - `result.cell(row, "column")`, which returns a `PgValue` with `value` and
@@ -184,7 +225,8 @@ See [Icy deployment notes](docs/icy.md) and the
 
 ## Build and test
 
-Build `../ablac` first. A compiler-only check is:
+Use an installed released compiler (`ablac` on PATH, or `ABLAC=/path/to/ablac`).
+A compiler-only check is:
 
 ```sh
 make check
@@ -194,7 +236,9 @@ The integration test starts temporary `postgres:16-alpine` containers on
 random loopback ports. It verifies trust, cleartext password, actual legacy
 MD5, and SCRAM-SHA-256 authentication, rejects wrong passwords for every
 password mode, exercises parameterized write/read and null decoding, and
-removes every container:
+removes every container. It also checks killed transaction backends, loss of
+BEGIN/COMMIT acknowledgements, persisted uncertain commits, the scalar bridge,
+and asynchronous transaction queues:
 
 ```sh
 make test
@@ -207,7 +251,7 @@ Set `ABLAC=/path/to/ablac` to select a different compiler binary.
 Use `scram-sha-256` for new deployments. SCRAM validates the server proof and
 never transmits the password. MD5 is implemented for compatibility but is
 deprecated by PostgreSQL. Cleartext `password` authentication should only be
-used over TLS; Abla Postgres does not provide TLS transport yet. `trust` is
+used over TLS. `trust` is
 appropriate only for tightly controlled test networks.
 
 SCRAM-SHA-256-PLUS requires TLS channel binding and is therefore not offered
@@ -218,8 +262,8 @@ and are outside this client module.
 One-shot helpers open one bounded connection per call. `PgClient` and
 `pgSessionQuery` reuse an authenticated connection and drain ordinary SQL
 errors through `ReadyForQuery`, while transport failures invalidate the session
-so the next call reconnects. Concurrent connection pooling, prepared statement
-reuse, transactions, binary values, and cancellation are future additions.
+and preserve explicit transaction loss. Prepared statement reuse, binary values,
+and cancellation remain future additions.
 
 ## License
 

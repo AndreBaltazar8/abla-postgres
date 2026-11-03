@@ -2,7 +2,7 @@
 set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-compiler=${ABLAC:-"$project_dir/../ablac/build/ablac"}
+compiler=${ABLAC:-ablac}
 password='abla-postgres-test-password'
 containers=''
 
@@ -18,6 +18,10 @@ mkdir -p "$project_dir/build"
     -o "$project_dir/build/protocol-test" --fast --no-cache
 "$compiler" build "$project_dir/tests/auth_failure_test.ab" \
     -o "$project_dir/build/auth-failure-test" --fast --no-cache
+"$compiler" build "$project_dir/tests/transaction_test.ab" \
+    -o "$project_dir/build/transaction-test" --fast --no-cache
+"$compiler" build "$project_dir/tests/async_test.ab" \
+    -o "$project_dir/build/async-test" --fast --no-cache
 
 run_mode() {
     mode=$1
@@ -60,7 +64,17 @@ run_mode() {
     POSTGRES_PASSWORD="$password" \
         "$project_dir/build/protocol-test"
 
+    POSTGRES_HOST=127.0.0.1 POSTGRES_PORT="$port" POSTGRES_DB=abla_test \
+    POSTGRES_USER=postgres POSTGRES_PASSWORD="$password" \
+        "$project_dir/build/transaction-test"
+
     if [ "$mode" != trust ]; then
+        # The existing pool regression uses42 as its successful process result.
+        pool_status=0
+        POSTGRES_HOST=127.0.0.1 POSTGRES_PORT="$port" POSTGRES_DB=abla_test \
+        POSTGRES_USER=postgres POSTGRES_PASSWORD="$password" \
+            "$project_dir/build/async-test" || pool_status=$?
+        if [ "$pool_status" -ne 42 ]; then echo "async pool failed: $pool_status"; exit 1; fi
         POSTGRES_HOST=127.0.0.1 \
         POSTGRES_PORT="$port" \
         POSTGRES_DB=abla_test \

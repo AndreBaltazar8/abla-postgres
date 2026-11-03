@@ -7,6 +7,7 @@ import "abla/sys/linux/net"
 import "abla/sys/linux/process"
 import "abla/bytes"
 import "abla/dns"
+import "abla/text"
 import "crypto.ab"
 
 class PgConfig(
@@ -24,6 +25,14 @@ class PgConfig(
     val sslRootCert: string = ""
 )
 
+// Keep connection policy when giving a dedicated checkpoint/lease session its
+// own budgets. Callers should not reconstruct a config positionally as new
+// host-selection policy is added.
+fun pgConfigWithTimeouts(config: PgConfig, connectMilliseconds: int, readMilliseconds: int): PgConfig = PgConfig(
+    config.host,config.port,config.database,config.user,config.password,
+    connectMilliseconds,readMilliseconds,config.sslMode,config.sslRootCert
+)
+
 class PgParameter(val value: string, val isNull: bool)
 
 fun pgText(value: string): PgParameter = PgParameter(value, false)
@@ -37,7 +46,11 @@ class PgResult(
     val columns: array<string>,
     val rows: array<array<PgValue>>,
     val command: string,
-    val error: string
+    val error: string,
+    val sqlState: string = "",
+    // The request may have committed, but its complete acknowledgement was
+    // lost. Resolve with application idempotency; never replay it here.
+    val outcomeUnknown: bool = false
 ) {
     fun first(column: string): string {
         var result = ""
@@ -87,15 +100,27 @@ val pgTlsAdded: array<PgTls> = []
 class PgClient(
     val config: PgConfig,
     var stream: PgStream,
-    var authenticated: bool
+    var authenticated: bool,
+    var transactionState: int = 0
 )
 
-// A value-shaped bridge for long-lived application state. Abla intentionally
-// does not allow mutable borrowing of a managed object stored globally, so
-// servers can retain these scalar fields and feed them into pgSessionQuery.
+val pgTransactionIdle = 0
+val pgTransactionOpen = 1
+val pgTransactionFailed = 2
+val pgTransactionLost = 3
+val pgTransactionUnknown = 4
+
+// Carry the complete logical session, including a disconnected transaction.
+// A socket descriptor alone cannot distinguish a fresh connection from a lost
+// transaction. Requiring this value prevents old callers dropping that state.
+class PgSessionState(
+    val descriptor: int = -1,
+    val buffered: string = "",
+    val transactionState: int = 0
+)
+
 class PgSessionResult(
-    val descriptor: int,
-    val buffered: string,
+    val state: PgSessionState,
     val result: PgResult
 )
 
@@ -104,7 +129,8 @@ fun pgDisconnectedStream(): PgStream = PgStream(TcpConnection(-1), "", 0)
 fun pgClient(config: PgConfig): PgClient = PgClient(
     config,
     pgDisconnectedStream(),
-    false
+    false,
+    pgTransactionIdle
 )
 
 fun pgEnvironment(name: string, fallback: string): string {
@@ -333,6 +359,54 @@ fun pgErrorMessage(body: string): string {
         index = index + 1
     }
     if (detail == "") message else "$message\nDETAIL: $detail"
+}
+
+fun pgErrorSqlState(body: string): string {
+    var index = 0
+    while (index < body.size && body[index] != 0) {
+        val field = body[index]
+        index = index + 1
+        val begin = index
+        while (index < body.size && body[index] != 0) index = index + 1
+        if (field == 67) return body.slice(begin,index)
+        index = index + 1
+    }
+    ""
+}
+
+// Only transaction-control words are examined; quoted text and comments are
+// never searched for BEGIN/COMMIT substrings. Extended queries contain exactly
+// one statement. Simple-query scripts are handled conservatively separately.
+fun pgTransactionControl(sql: string): int {
+    val words: array<string> = []
+    var index = 0
+    while (index < sql.size && words.size < 4) {
+        val byte = sql[index]
+        if (byte == 32 || byte == 9 || byte == 10 || byte == 13) index = index + 1
+        else if (index + 1 < sql.size && byte == 45 && sql[index+1] == 45) {
+            while (index < sql.size && sql[index] != 10) index = index + 1
+        } else if (index + 1 < sql.size && byte == 47 && sql[index+1] == 42) {
+            var depth = 1
+            index = index + 2
+            while (index < sql.size && depth > 0) {
+                if (index+1 < sql.size && sql[index] == 47 && sql[index+1] == 42) { depth = depth + 1; index = index + 2 }
+                else if (index+1 < sql.size && sql[index] == 42 && sql[index+1] == 47) { depth = depth - 1; index = index + 2 }
+                else index = index + 1
+            }
+        } else if ((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)) {
+            val begin = index
+            while (index < sql.size && ((sql[index]>=65 && sql[index]<=90) || (sql[index]>=97 && sql[index]<=122))) index = index + 1
+            words.append(sql.slice(begin,index).uppercase())
+        } else break
+    }
+    if (words.size == 0) return 0
+    if (words[0] == "BEGIN" || (words[0] == "START" && words.size > 1 && words[1] == "TRANSACTION")) return 1
+    if (words[0] == "COMMIT" || words[0] == "END" || (words[0] == "PREPARE" && words.size > 1 && words[1] == "TRANSACTION")) return 2
+    if (words[0] == "ROLLBACK" || words[0] == "ABORT") {
+        for (word in words) if (word == "TO") return 0
+        return 3
+    }
+    0
 }
 
 fun pgConnect(config: PgConfig): PgStream {
@@ -590,6 +664,7 @@ fun pgExtendedQuery(sql: string, parameters: array<PgParameter>): string {
 }
 
 fun PgClient.disconnect(): void {
+    if (this.transactionState == pgTransactionOpen || this.transactionState == pgTransactionFailed) this.transactionState = pgTransactionLost
     if (this.stream.tls != 0) pgTlsAdded[0].close(this.stream.tls)
     this.stream.tls = 0
     if (this.stream.connection.descriptor >= 0) this.stream.connection.close()
@@ -599,6 +674,7 @@ fun PgClient.disconnect(): void {
 }
 
 fun PgClient.connect(): string {
+    if (this.transactionState != pgTransactionIdle) return "Cannot reconnect an open or lost PostgreSQL transaction; roll back or close the client first"
     this.disconnect()
     val problem = pgTlsProblem(this.config)
     if (problem != "") return problem
@@ -620,7 +696,7 @@ fun PgClient.query(
 ): PgResult {
     val replyTimeout = if (timeoutMilliseconds > 0) timeoutMilliseconds
         else this.config.readTimeoutMilliseconds
-    this.exchange(pgExtendedQuery(sql, parameters), replyTimeout)
+    this.exchange(pgExtendedQuery(sql, parameters), replyTimeout, pgTransactionControl(sql))
 }
 
 // Several statements in one string, as in a migration file, through the simple
@@ -637,18 +713,38 @@ fun PgClient.script(
     this.exchange(
         pgTypedMessage(81, body),
         if (timeoutMilliseconds > 0) timeoutMilliseconds
-        else this.config.readTimeoutMilliseconds
+        else this.config.readTimeoutMilliseconds,
+        4
     )
 }
 
-private fun PgClient.exchange(request: string, replyTimeout: int): PgResult {
+private fun PgClient.exchange(request: string, replyTimeout: int, control: int): PgResult {
+    val before = this.transactionState
+    if (before == pgTransactionLost || before == pgTransactionUnknown) {
+        val unknown = before == pgTransactionUnknown
+        if (control == 3) {
+            this.transactionState = pgTransactionIdle
+            // This resets a disconnected client. It cannot undo a COMMIT whose
+            // acknowledgement was lost, so never claim that outcome rolled back.
+            return PgResult(!unknown,[],[],"ROLLBACK",if (unknown) "Transaction outcome is unknown; rollback reset the client only" else "",if (unknown) "08007" else "",unknown)
+        }
+        return PgResult(false,[],[],"",if (unknown) "PostgreSQL transaction outcome is unknown; resolve it before retrying, then roll back or reset the client" else "PostgreSQL transaction connection was lost; roll back or reset the client",if (unknown) "08007" else "08006",unknown)
+    }
     var error = ""
     if (!this.authenticated) error = this.connect()
+    if (error != "") return PgResult(false,[],[],"",error,"08001")
     val columns: array<string> = []
     val rows: array<array<PgValue>> = []
     var command = ""
+    var sqlState = ""
     var transportFailed = false
+    var sent = false
     if (error == "") {
+        // Record a possible BEGIN before sending it: losing its ReadyForQuery
+        // must not make the next statement an autocommitted write. A script may
+        // contain arbitrary transaction boundaries, so loss is conservative.
+        if ((control == 1 || control == 4) && before == pgTransactionIdle) this.transactionState = pgTransactionOpen
+        sent = true
         if (this.stream.send(request) < 0) {
             error = "Could not send PostgreSQL query"
             transportFailed = true
@@ -665,7 +761,9 @@ private fun PgClient.exchange(request: string, replyTimeout: int): PgResult {
                 else "Timed out while reading PostgreSQL query result"
             }
             transportFailed = true
-        } else if (message.kind == 69) error = pgErrorMessage(message.body)
+        } else if (message.kind == 69) {
+            if (error == "") { error = pgErrorMessage(message.body); sqlState = pgErrorSqlState(message.body) }
+        }
         else if (message.kind == 84 && error == "") {
             val described = pgParseColumns(message.body)
             var index = 0
@@ -678,10 +776,33 @@ private fun PgClient.exchange(request: string, replyTimeout: int): PgResult {
         } else if (message.kind == 67 && message.body.size > 0 &&
             error == "") {
             command = message.body.slice(0, message.body.size - 1)
-        } else if (message.kind == 90) ready = true
+        } else if (message.kind == 90) {
+            if (message.body.size != 1 || (message.body[0] != 73 && message.body[0] != 84 && message.body[0] != 69)) {
+                error = "PostgreSQL sent an invalid transaction state"
+                transportFailed = true
+            } else {
+                this.transactionState = if (message.body[0] == 84) pgTransactionOpen else if (message.body[0] == 69) pgTransactionFailed else pgTransactionIdle
+                ready = true
+            }
+        }
     }
-    if (transportFailed) this.disconnect()
-    PgResult(error == "" && ready, columns, rows, command, error)
+    var unknown = false
+    if (transportFailed) {
+        unknown = sent && (control == 2 || control == 4 || (before == pgTransactionIdle && control != 1))
+        if (before != pgTransactionIdle || (sent && (control == 1 || control == 2 || control == 4))) this.transactionState = if (unknown) pgTransactionUnknown else pgTransactionLost
+        this.disconnect()
+        if (sqlState == "") sqlState = if (unknown) "08007" else "08006"
+    } else if (sqlState == "25006" || sqlState == "57P01" || sqlState == "57P02" || sqlState == "57P03" || sqlState.startsWith("08")) {
+        // A demoted/read-only server is not reused. Fail this operation, and
+        // select another writable host only for a later new operation.
+        if (this.transactionState != pgTransactionIdle) this.transactionState = pgTransactionLost
+        this.disconnect()
+    }
+    if (error == "" && control == 2 && command == "ROLLBACK") {
+        error = "PostgreSQL rolled back the failed transaction instead of committing"
+        sqlState = "25P02"
+    }
+    PgResult(error == "" && ready, columns, rows, command, error,sqlState,unknown)
 }
 
 fun PgClient.execute(
@@ -690,24 +811,30 @@ fun PgClient.execute(
     timeoutMilliseconds: int = 0
 ): PgResult = this.query(sql, parameters, timeoutMilliseconds)
 
-fun PgClient.close(): void = this.disconnect()
+fun PgClient.close(): void {
+    this.disconnect()
+    this.transactionState = pgTransactionIdle
+    return
+}
 
 // A TLS session's handle, as a descriptor: above any real one.
 val pgSessionTls = 4611686018427387904
 
 fun pgSessionQuery(
     config: PgConfig,
-    descriptor: int,
-    buffered: string,
+    state: PgSessionState,
     sql: string,
     parameters: array<PgParameter> = [],
     timeoutMilliseconds: int = 0
 ): PgSessionResult {
+    val descriptor = state.descriptor
+    val buffered = state.buffered
     val client = PgClient(
         config,
         if (descriptor >= pgSessionTls) PgStream(TcpConnection(-1), buffered, descriptor - pgSessionTls)
         else PgStream(TcpConnection(descriptor), buffered, 0),
-        descriptor >= 0
+        descriptor >= 0,
+        state.transactionState
     )
     val result = client.query(sql, parameters, timeoutMilliseconds)
     val nextDescriptor = if (client.stream.tls != 0) pgSessionTls + client.stream.tls else client.stream.connection.descriptor
@@ -717,8 +844,7 @@ fun pgSessionQuery(
     // the reusable socket as this function returns.
     client.stream.connection.descriptor = -1
     PgSessionResult(
-        nextDescriptor,
-        nextBuffered,
+        PgSessionState(nextDescriptor,nextBuffered,client.transactionState),
         result
     )
 }

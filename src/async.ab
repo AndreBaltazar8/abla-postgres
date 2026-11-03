@@ -50,6 +50,7 @@ val pgAsyncBusy = 4
 val pgAsyncQueryOp = 0
 val pgAsyncBeginOp = 1
 val pgAsyncEndOp = 2
+val pgAsyncCommitOp = 3
 
 resource class PgPool(
     val config: PgConfig,
@@ -96,7 +97,8 @@ resource class PgPool(
     var scramSaltKey: string,
     var scramSaltedPassword: string,
     var connectFailures: int,
-    var reconnectAfter: int
+    var reconnectAfter: int,
+    val connSqlStates: array<string>
 ) {
     fun drop(): void {
         var slot = 0
@@ -118,7 +120,7 @@ fun pgPool(config: PgConfig, options: PgPoolOptions = PgPoolOptions()): PgPool =
         [], [], [], [], [], [], [],
         [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [],
         [], [],
-        [], [], [], [], 1, 0, "", "", "", 0, 0
+        [], [], [], [], 1, 0, "", "", "", 0, 0, []
     )
 
 // postgres://user:password@host:port/database (percent-encoded parts allowed).
@@ -290,7 +292,7 @@ fun PgPool.finishOp(op: int, result: PgResult): void {
         this.pendingOps = this.pendingOps - 1
         // Ending a transaction (successfully or not) releases its pin.
         val tx = this.opTransactions[op]
-        if (tx != 0 && this.opKinds[op] == pgAsyncEndOp) {
+        if (tx != 0 && (this.opKinds[op] == pgAsyncEndOp || this.opKinds[op] == pgAsyncCommitOp)) {
             val index = this.transactionIndex(tx)
             if (index >= 0) {
                 val slot = this.txConnections[index]
@@ -304,8 +306,11 @@ fun PgPool.finishOp(op: int, result: PgResult): void {
     return
 }
 
-fun PgPool.failOp(op: int, error: string): void =
-    this.finishOp(op, PgResult(false, [], [], "", error))
+fun PgPool.failOp(op: int, error: string): void {
+    val unknown = this.opStates[op] == 2 && (this.opKinds[op] == pgAsyncCommitOp || (this.opKinds[op] == pgAsyncQueryOp && this.opTransactions[op] == 0))
+    this.finishOp(op, PgResult(false, [], [], "", error,if (unknown) "08007" else "",unknown))
+    return
+}
 
 // Fails every queued operation of a transaction whose connection died.
 fun PgPool.failTransaction(tx: int, error: string): void {
@@ -348,9 +353,9 @@ fun PgPool.closeConnection(slot: int, error: string): void {
     }
     this.connStates[slot] = pgAsyncFree
     val op = this.connOps[slot]
+    val tx = this.connTransactions[slot]
     this.connOps[slot] = -1
     if (op >= 0) this.failOp(op, error)
-    val tx = this.connTransactions[slot]
     this.connTransactions[slot] = 0
     if (tx != 0) this.failTransaction(tx, "transaction connection lost: $error")
     this.connInputs[slot] = ""
@@ -438,6 +443,7 @@ fun PgPool.openConnection(): int {
         this.connRows.append([])
         this.connCommands.append("")
         this.connErrors.append("")
+        this.connSqlStates.append("")
     }
     this.connDescriptors[slot] = descriptor
     this.connStates[slot] = pgAsyncConnecting
@@ -534,7 +540,10 @@ fun PgPool.handleAuthentication(slot: int, kind: int, body: string): void {
 
 fun PgPool.handleQueryMessage(slot: int, kind: int, body: string): void {
     if (kind == 69) {
-        if (this.connErrors[slot] == "") this.connErrors[slot] = pgErrorMessage(body)
+        if (this.connErrors[slot] == "") {
+            this.connErrors[slot] = pgErrorMessage(body)
+            this.connSqlStates[slot] = pgErrorSqlState(body)
+        }
     } else if (kind == 84 && this.connErrors[slot] == "") {
         this.connColumns[slot] = pgParseColumns(body)
     } else if (kind == 68 && this.connErrors[slot] == "") {
@@ -542,25 +551,44 @@ fun PgPool.handleQueryMessage(slot: int, kind: int, body: string): void {
     } else if (kind == 67 && body.size > 0 && this.connErrors[slot] == "") {
         this.connCommands[slot] = body.slice(0, body.size - 1)
     } else if (kind == 90) {
+        if (body.size != 1 || (body[0] != 73 && body[0] != 84 && body[0] != 69)) {
+            this.closeConnection(slot,"PostgreSQL sent an invalid transaction state")
+            return
+        }
         val op = this.connOps[slot]
         this.connOps[slot] = -1
         this.connStates[slot] = pgAsyncIdle
-        val error = this.connErrors[slot]
+        var error = this.connErrors[slot]
+        var sqlState = this.connSqlStates[slot]
+        if (op >= 0 && this.opKinds[op] == pgAsyncCommitOp && error == "" && this.connCommands[slot] == "ROLLBACK") {
+            error = "PostgreSQL rolled back the failed transaction instead of committing"
+            sqlState = "25P02"
+        }
         val result = PgResult(
             error == "", this.connColumns[slot], this.connRows[slot],
-            this.connCommands[slot], error
+            this.connCommands[slot], error,sqlState
         )
         this.connColumns[slot] = []
         this.connRows[slot] = []
         this.connCommands[slot] = ""
         this.connErrors[slot] = ""
+        this.connSqlStates[slot] = ""
         // A failed BEGIN never pinned anything server-side.
         if (op >= 0 && this.opKinds[op] == pgAsyncBeginOp && error != "") {
             val tx = this.opTransactions[op]
             this.connTransactions[slot] = 0
             this.finishOp(op, result)
             this.failTransaction(tx, "transaction could not begin: $error")
-        } else this.finishOp(op, result)
+        } else {
+            val tx = this.connTransactions[slot]
+            val endedOutsideApi = tx != 0 && op >= 0 && this.opKinds[op] != pgAsyncEndOp && this.opKinds[op] != pgAsyncCommitOp && body[0] == 73
+            this.finishOp(op, result)
+            if (endedOutsideApi) {
+                this.connTransactions[slot] = 0
+                this.failTransaction(tx,"transaction ended outside the pool commit/rollback API")
+            }
+        }
+        if (sqlState == "25006" || sqlState == "57P01" || sqlState == "57P02" || sqlState == "57P03" || sqlState.startsWith("08")) this.closeConnection(slot,"PostgreSQL server session is no longer usable")
     }
     return
 }
@@ -636,6 +664,7 @@ fun PgPool.startOp(slot: int, op: int): void {
     this.connRows[slot] = []
     this.connCommands[slot] = ""
     this.connErrors[slot] = ""
+    this.connSqlStates[slot] = ""
     this.queueOutput(slot, this.opPayloads[op])
     return
 }
@@ -659,6 +688,11 @@ fun PgPool.dispatch(): void {
             var target = -1
             if (tx != 0 && this.opKinds[op] != pgAsyncBeginOp) {
                 val index = this.transactionIndex(tx)
+                if (index < 0) {
+                    this.failOp(op,"unknown or finished transaction")
+                    op = op + 1
+                    continue
+                }
                 val pinned = if (index >= 0) this.txConnections[index] else -1
                 if (pinned >= 0 && this.connStates[pinned] == pgAsyncIdle) target = pinned
             } else {
@@ -813,7 +847,7 @@ fun PgPool.begin(): int {
 }
 
 fun PgPool.commit(transaction: int): int =
-    this.enqueue(pgAsyncEndOp, transaction, pgExtendedQuery("COMMIT", []), 0)
+    this.enqueue(pgAsyncCommitOp, transaction, pgExtendedQuery("COMMIT", []), 0)
 
 fun PgPool.rollback(transaction: int): int =
     this.enqueue(pgAsyncEndOp, transaction, pgExtendedQuery("ROLLBACK", []), 0)

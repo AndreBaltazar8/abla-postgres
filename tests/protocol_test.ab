@@ -44,7 +44,7 @@ fun timeoutChecks(config: PgConfig): int {
     // Over a query's limit through the other entry points as well.
     if (pgQuery(config, "SELECT pg_sleep(1.5)", [], 300).succeeded) return 107
     if (pgExecute(config, "SELECT pg_sleep(1.5)", [], 300).succeeded) return 108
-    val session = pgSessionQuery(config, -1, "", "SELECT pg_sleep(1.5)", [], 300)
+    val session = pgSessionQuery(config, PgSessionState(), "SELECT pg_sleep(1.5)", [], 300)
     if (session.result.succeeded) return 109
     // A reply that takes many reads isn't a slow one.
     val large = pgQuery(withReadTimeout(config, 300), "SELECT repeat('x', 8000000) AS value", [])
@@ -95,16 +95,15 @@ fun main: int {
     val afterReconnect = client.query("SELECT 'reconnected' AS state", [])
     client.close()
     val firstSession = pgSessionQuery(
-        config, -1, "", "SELECT 'first' AS state", []
+        config, PgSessionState(), "SELECT 'first' AS state", []
     )
     val secondSession = pgSessionQuery(
         config,
-        firstSession.descriptor,
-        firstSession.buffered,
+        firstSession.state,
         "SELECT 'second' AS state",
         []
     )
-    val reusableDescriptor = secondSession.descriptor
+    val reusableDescriptor = secondSession.state.descriptor
     val sessionConnection = TcpConnection(reusableDescriptor)
     sessionConnection.close()
     val timing = timeoutChecks(config)
