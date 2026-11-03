@@ -1,0 +1,72 @@
+import "../src/postgres.ab"
+import "abla/io"
+import "abla/fs"
+import "abla/process/time"
+
+fun server(): int {
+    val parent=pgInt(linuxArgument(1))
+    if(parent<=0 || linuxSyscall5(157,1,9,0,0,0)!=0 || linuxSyscall0(110)!=parent) return 2
+    linuxSyscall1(37,3)
+    val listener=tcpListenAddress(Ipv4SocketAddress("127.0.0.1",0))
+    if(listener.descriptor<0) return 3
+    println("${listener.localPort()}")
+    val peer=listener.accept()
+    val small=nativeByteBuffer(4)
+    linuxNetStoreU32(small,0,4096)
+    linuxSyscall5(54,peer.descriptor,1,8,nativePointerAddress(small.address),4)
+    small.close()
+    if(peer.readWithTimeoutResult(4096,1000).bytes.size<8) return 4
+    if(linuxArgument(0)=="oversize") peer.write("R\x00\x01\x00\x01")
+    else peer.write(pgTypedMessage(82,[0,0,0,3]))
+    // Never consume the authentication response: force actual write pressure,
+    // rather than just waiting for a server reply after a successful write.
+    sleep(1000)
+    peer.close()
+    0
+}
+
+fun attempt(mode: string): bool {
+    val parent=linuxProcessId()
+    val ready="build/auth-deadline-$mode-$parent.ready"
+    val child=linuxCommand("/proc/$parent/exe").argument(mode).argument("$parent").output(ready).start()
+    val readyDeadline=linuxMonotonicMilliseconds()+3000
+    var port=0
+    while(port<=0 && linuxMonotonicMilliseconds()<readyDeadline) { port=pgInt(linuxReadFile(ready,64).trim()); if(port<=0) sleep(5) }
+    var fine=false
+    if(port>0) {
+        if(mode=="whole") {
+            val config=PgConfig("127.0.0.1",port,"test","test","x".repeat(1048576),200,2000)
+            val client=pgClient(config)
+            val started=linuxMonotonicMilliseconds()
+            val result=client.query("SELECT 1")
+            client.close()
+            val elapsed=linuxMonotonicMilliseconds()-started
+            fine=!result.succeeded && elapsed>=150 && elapsed<500
+            println("${if(fine) "ok" else "FAIL"} whole query/connect/close elapsed=$elapsed error=${result.error}")
+        } else {
+        val stream=PgStream(tcpConnectIpv4("127.0.0.1",port,1000),"",0)
+        val small=nativeByteBuffer(4)
+        linuxNetStoreU32(small,0,4096)
+        linuxSyscall5(54,stream.connection.descriptor,1,7,nativePointerAddress(small.address),4)
+        small.close()
+        val config=PgConfig("127.0.0.1",port,"test","test","x".repeat(1048576),200,2000,"disable","","any")
+        val started=linuxMonotonicMilliseconds()
+        val error=pgAuthenticate(stream,config,started+200)
+        val elapsed=linuxMonotonicMilliseconds()-started
+        fine=if(mode=="oversize") error!="" && elapsed<150 else error.contains("send PostgreSQL password") && elapsed>=150 && elapsed<500
+        println("${if(fine) "ok" else "FAIL"} $mode elapsed=$elapsed error=$error")
+        stream.connection.close()
+        }
+    }
+    val reaped=linuxWaitProcess(child.process).status==0
+    Path(ready).remove()
+    fine && reaped
+}
+
+fun main: int {
+    if(linuxArgument(0)=="stalled" || linuxArgument(0)=="oversize" || linuxArgument(0)=="whole") return server()
+    val stalled=attempt("stalled")
+    val oversize=attempt("oversize")
+    val whole=attempt("whole")
+    if(stalled && oversize && whole) 0 else 1
+}

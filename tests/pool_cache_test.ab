@@ -1,0 +1,134 @@
+import "../src/async.ab"
+import "abla/io"
+import "abla/fs"
+import "abla/process/time"
+
+fun startup(var stream: PgStream): bool {
+    var bytes=""
+    val deadline=linuxMonotonicMilliseconds()+3000
+    while(bytes.size<4 && linuxMonotonicMilliseconds()<deadline) bytes=bytes+stream.connection.readWithTimeoutResult(4096,1000).bytes
+    if(bytes.size<4) return false
+    val size=pgReadU32(bytes,0)
+    if(size<8 || size>4096) return false
+    while(bytes.size<size && linuxMonotonicMilliseconds()<deadline) bytes=bytes+stream.connection.readWithTimeoutResult(4096,1000).bytes
+    stream.buffered=bytes.slice(size,bytes.size)
+    bytes.size>=size
+}
+fun authenticated(stream: PgStream): void { stream.send("${pgTypedMessage(82,[0,0,0,0])}${pgTypedMessage(90,[73])}"); return }
+fun query(var stream: PgStream): bool {
+    val deadline=linuxMonotonicMilliseconds()+3000
+    while(linuxMonotonicMilliseconds()<deadline) { val message=stream.next(1000,deadline); if(!message.valid) return false; if(message.kind==83) return true }
+    false
+}
+fun reply(stream: PgStream, marker: string): void {
+    val command: array<int> = []
+    pgAppendCString(command,marker)
+    stream.send("${pgTypedMessage(67,command)}${pgTypedMessage(90,[73])}")
+    return
+}
+fun fixture(): int {
+    val parent=pgInt(linuxArgument(1))
+    if(parent<=0 || linuxSyscall5(157,1,9,0,0,0)!=0 || linuxSyscall0(110)!=parent) return 2
+    linuxSyscall1(37,10)
+    val mode=linuxArgument(0)
+    val folder=linuxArgument(2)
+    val listener=tcpListenAddress(Ipv4SocketAddress(if(mode=="A") "127.0.0.2" else "127.0.0.3",pgInt(linuxArgument(3))))
+    if(listener.descriptor<0) return 3
+    println("${listener.localPort()}")
+    val first=PgStream(listener.accept(),"",0)
+    if(!startup(first)) return 4
+    Path("$folder/$mode.stage").writeText("first-startup")
+    if(mode=="A") {
+        val failed=PgStream(listener.accept(),"",0)
+        if(!startup(failed)) return 5
+        failed.connection.close()
+        Path("$folder/A.stage").writeText("second-closed")
+        while(!Path("$folder/release-A").exists()) sleep(1)
+        authenticated(first)
+        Path("$folder/A.stage").writeText("released")
+        if(!query(first)) return 6
+        reply(first,"A")
+        Path("$folder/A.stage").writeText("first-replied")
+        if(!query(first)) return 7
+        Path("$folder/A.stage").writeText("hold")
+        val third=PgStream(listener.accept(),"",0)
+        if(!startup(third)) return 8
+        authenticated(third)
+        if(!query(third)) return 9
+        reply(third,"A")
+        reply(first,"A")
+        third.connection.close()
+    } else {
+        authenticated(first)
+        if(!query(first)) return 10
+        Path("$folder/B.busy").writeText("busy")
+        while(!Path("$folder/release-B").exists()) sleep(1)
+        reply(first,"B")
+        Path("$folder/B.stage").writeText("first-replied")
+        while(!Path("$folder/done").exists()) {
+            if(linuxPollSocket(listener.descriptor,true,false,5).readable) {
+                val wrong=PgStream(listener.accept(),"",0)
+                if(!startup(wrong)) return 11
+                authenticated(wrong)
+                if(!query(wrong)) return 12
+                reply(wrong,"B")
+                wrong.connection.close()
+            }
+        }
+    }
+    first.connection.close()
+    0
+}
+fun stopOwned(child: LinuxChildProcess): void {
+    if(linuxWaitProcess(child.process,true).output!="pending") return
+    if(Path("/proc/${child.process}/exe").linkTarget().replace(" (deleted)","")==Path("/proc/self/exe").linkTarget().replace(" (deleted)","")) linuxSyscall2(62,child.process,15)
+    linuxWaitProcess(child.process)
+    return
+}
+fun main: int {
+    if(linuxArgument(0)=="A" || linuxArgument(0)=="B") return fixture()
+    val parent=linuxProcessId()
+    val folder="build/pool-cache-$parent"
+    Path(folder).createDirectories()
+    val a=linuxCommand("/proc/$parent/exe").argument("A").argument("$parent").argument(folder).argument("0").output("$folder/A.ready").start()
+    val deadline=linuxMonotonicMilliseconds()+5000
+    var port=0
+    while(port<=0 && linuxMonotonicMilliseconds()<deadline) { port=pgInt(linuxReadFile("$folder/A.ready",64).trim()); if(port<=0) sleep(5) }
+    if(port<=0) { stopOwned(a); return 1 }
+    val b=linuxCommand("/proc/$parent/exe").argument("B").argument("$parent").argument(folder).argument("$port").output("$folder/B.ready").start()
+    while(pgInt(linuxReadFile("$folder/B.ready",64).trim())<=0 && linuxMonotonicMilliseconds()<deadline) sleep(5)
+    val pool=pgPool(PgConfig("127.0.0.2:$port,127.0.0.3:$port",port,"test","test","",6000,3000,"disable","","any"),PgPoolOptions(2,6000,6000))
+    pool.query("first")
+    pool.query("second")
+    var initial=0
+    var sawB=false
+    while(initial<2 && linuxMonotonicMilliseconds()<deadline) {
+        if(Path("$folder/B.busy").exists()) Path("$folder/release-A").writeText("go")
+        if(Path("$folder/A.stage").readText()=="first-replied") Path("$folder/release-B").writeText("go")
+        pool.step(5)
+        for(result in pool.takeResults()) {
+            initial=initial+1
+            println("initial id=${result.id} command=${result.result.command} error=${result.result.error}")
+            if(result.result.command=="B") { sawB=true; Path("$folder/release-A").writeText("go") }
+        }
+    }
+    var fine=initial==2 && sawB
+    println("initial=$initial sawB=$sawB candidate=${pool.candidateIndex} cache=${pool.address}")
+    for(slot in 0 until pool.connStates.size) if(pool.connAddresses[slot]=="127.0.0.3" && pool.connStates[slot]!=pgAsyncFree) pool.closeConnection(slot,"recycle owned fixture B")
+    pool.query("hold A busy")
+    val next=pool.query("next connection must be A")
+    var done=false
+    while(!done && linuxMonotonicMilliseconds()<deadline) {
+        pool.step(5)
+        for(result in pool.takeResults()) if(result.id==next) { fine=fine && result.result.succeeded && result.result.command=="A"; done=true; println("next target=${result.result.command}") }
+    }
+    fine=fine && done
+    Path("$folder/done").writeText("done")
+    pool.drop()
+    stopOwned(a)
+    stopOwned(b)
+    if(fine) Path(folder).removeTree()
+    else println("evidence=$folder A=${Path("$folder/A.stage").readText()} B=${Path("$folder/B.stage").readText()}")
+    println("${if(fine) "ok" else "FAIL"} delayed A success cannot reuse cached B address")
+    if(fine) 0 else 1
+}

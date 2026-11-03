@@ -60,6 +60,15 @@ fun lostBeginServer(): int {
             if (!message.valid) return 7
             synced=message.kind==83
         }
+        if(linuxArgument(0)=="coalesced-notify") {
+            val notice: array<int> = []
+            pgAppendU32(notice,123)
+            pgAppendCString(notice,"owned_notifications")
+            pgAppendCString(notice,"before-detach")
+            stream.send("${pgTypedMessage(67,[76,73,83,84,69,78,0])}${pgTypedMessage(90,[73])}${pgTypedMessage(65,notice)}")
+            stream.connection.close()
+            return 0
+        }
         if (commit && statement==0) stream.send("${pgTypedMessage(67,[66,69,71,73,78,0])}${pgTypedMessage(90,[84])}")
     }
     // BEGIN ran, but ReadyForQuery(T) is lost. A client tracking only the last
@@ -154,11 +163,40 @@ fun bridgeCommitReplyChecks(): void {
     return
 }
 
+fun coalescedNotificationChecks(): void {
+    val parent=linuxProcessId()
+    val ready="build/coalesced-notify-$parent.ready"
+    val child=linuxCommand("/proc/$parent/exe").argument("coalesced-notify").argument("$parent").output(ready).start()
+    val deadline=linuxMonotonicMilliseconds()+3000
+    var port=0
+    while(port<=0 && linuxMonotonicMilliseconds()<deadline) { port=pgInt(linuxReadFile(ready,64).trim()); if(port<=0) sleep(5) }
+    check(port>0,"owned coalesced LISTEN fixture ready")
+    if(port>0) {
+        val pool=pgPool(PgConfig("127.0.0.1",port,"test","test","",500,500,"disable","","any"),PgPoolOptions(1,1000,500))
+        val id=pool.query("LISTEN owned_notifications")
+        check(resultOf(drain(pool,1),id).succeeded,"LISTEN acknowledgement is complete")
+        val detached=pool.detachConnection(0)
+        pool.drop()
+        check(detached.descriptor>=0,"idle authenticated connection can transfer ownership")
+        if(detached.descriptor>=0) {
+            val stream=PgStream(TcpConnection(detached.descriptor),detached.buffered,0)
+            val message=stream.next(100,linuxMonotonicMilliseconds()+200)
+            check(message.valid && message.kind==65 && message.body.contains("before-detach"),"notification coalesced with ReadyForQuery survives detachment")
+            stream.connection.close()
+        }
+    }
+    check(linuxWaitProcess(child.process).status==0,"coalesced fixture exited and was reaped")
+    Path(ready).remove()
+    return
+}
+
 fun main: int {
-    if (linuxArgument(0)=="lost-begin" || linuxArgument(0)=="lost-commit") return lostBeginServer()
+    if (linuxArgument(0)=="lost-begin" || linuxArgument(0)=="lost-commit" || linuxArgument(0)=="coalesced-notify") return lostBeginServer()
+    if(linuxArgument(0)=="notify-proof") { coalescedNotificationChecks(); println("$checks checks, $failures failed"); return if(failures==0) 0 else 1 }
     lostBeginChecks()
     asyncCommitReplyChecks()
     bridgeCommitReplyChecks()
+    coalescedNotificationChecks()
     val config = pgConfigFromEnvironment()
     val admin = pgClient(config)
     check(admin.script("CREATE TABLE IF NOT EXISTS abla_transaction_safety(id int PRIMARY KEY); DELETE FROM abla_transaction_safety").succeeded,"private fixture table")

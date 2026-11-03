@@ -4,7 +4,7 @@
 optional `:port` per candidate (otherwise `POSTGRES_PORT`). Authentication,
 TLS, and a writable-target probe share one connect deadline across candidates;
 `POSTGRES_TARGET_SESSION_ATTRS=any` explicitly permits read-only connections.
-The default is `read-write`. A `25006` read-only error discards that session and
+The default is `read-write`. Async pool callers must supply `resolvedCandidates` for DNS names from a resolver outside the event loop; uncached names are refused immediately rather than blocking `query()` or `step(0)`. Numeric addresses and localhost need no lookup. A `25006` read-only error discards that session and
 fails the operation; a later independent operation can select a writer. No SQL
 is replayed during failover. `pgConfigWithTimeouts` retains this policy when
 giving a checkpoint connection a separate budget. The bounded connector uses
@@ -59,7 +59,7 @@ a `PgConfig`'s `sslMode` and `sslRootCert`, or `POSTGRES_SSLMODE` and `POSTGRES_
 - `verify-full`: that, and it names `host`, as a name or as an address.
 
 There's no fallback: a server without TLS, a certificate that doesn't check out, or a program that asks without
-having added it gets an error, not a plain connection. Without the import a program links no OpenSSL. The async pool has no TLS, and says so.
+having added it gets an error, not a plain connection. Without the import a program links no OpenSSL. The async pool uses the same TLS policy through nonblocking SSLRequest, handshake, authentication and query states. `detachConnection(slot)` transfers both the fd and its TLS handle for a dedicated LISTEN connection; copying only an fd is insufficient. A pool can receive `resolvedCandidates` from an off-loop resolver while retaining the original host names for certificate checks.
 
 ## Querying
 
@@ -282,3 +282,5 @@ and cancellation remain future additions.
 ## License
 
 Abla Postgres is licensed under the [Mozilla Public License 2.0](LICENSE).
+
+Authentication frames are limited to64KiB. Connection deadlines include CPU derivation, startup/password/SASL writes, TLS reads/handshake and teardown. Pre-detach NOTIFY frames are retained with a256KiB per-connection bound and transferred before any partial input frame.

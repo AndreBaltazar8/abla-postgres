@@ -139,6 +139,8 @@ class PgMessage(val kind: int, val body: string, val valid: bool)
 
 // `tls` is the handle of the TLS session that took the connection over, 0 without one.
 class PgStream(val connection: TcpConnection, var buffered: string, var tls: int)
+// status:1 progress,2 WANT_READ,3 WANT_WRITE,0 EOF,-1 fatal error.
+class PgTlsIo(val text: string, val written: int, val status: int)
 
 // What src/tls.ab adds, so that only a program importing it links OpenSSL.
 interface PgTls {
@@ -147,6 +149,13 @@ interface PgTls {
     fun send(handle: int, bytes: string): int
     fun receive(handle: int, timeoutMilliseconds: int): string
     fun close(handle: int): void
+    // Nonblocking pool operations. start leaves fd owned by its caller on
+    // failure; a successful handle owns it until close or explicit transfer.
+    fun start(descriptor: int, host: string, mode: string, rootCert: string): int
+    fun handshake(handle: int): int
+    fun sendReady(handle: int, bytes: string, offset: int): PgTlsIo
+    fun receiveReady(handle: int, maximum: int): PgTlsIo
+    fun sendUntil(handle: int, bytes: string, deadline: int): int
 }
 val pgTlsAdded: array<PgTls> = []
 
@@ -326,12 +335,36 @@ val pgOversizedMessage = -1
 fun PgStream.send(bytes: string): int =
     if (this.tls != 0) pgTlsAdded[0].send(this.tls, bytes) else this.connection.write(bytes)
 
-fun PgStream.next(timeoutMilliseconds: int, deadline: int = 0): PgMessage {
+fun PgStream.sendWithin(bytes: string, deadline: int): int {
+    if(deadline<=0) return this.send(bytes)
+    if(this.tls!=0) return pgTlsAdded[0].sendUntil(this.tls,bytes,deadline)
+    val descriptor=this.connection.descriptor
+    if(descriptor<0 || !linuxSocketSetNonblocking(descriptor,true)) return -1
+    var offset=0
+    var healthy=true
+    while(healthy && offset<bytes.size && linuxMonotonicMilliseconds()<deadline) {
+        val sent=this.connection.writeCompact(bytes,offset)
+        if(sent.written>0) offset=offset+sent.written
+        if(sent.status=="error" && sent.errorCode!=11) healthy=false
+        else if(offset<bytes.size) {
+            val budget=pgRemaining(deadline,10000)
+            if(budget<=0) healthy=false
+            else {
+                val polled=linuxPollSocket(descriptor,false,true,budget)
+                if(polled.timedOut || polled.closed || polled.errorCode!=0) healthy=false
+            }
+        }
+    }
+    linuxSocketSetNonblocking(descriptor,false)
+    if(healthy && offset==bytes.size) offset else -1
+}
+
+fun PgStream.next(timeoutMilliseconds: int, deadline: int = 0, maximumMessageBytes: int = pgLargestMessage): PgMessage {
     var enough = this.buffered.size >= 5
     var total = 0
     if (enough) total = 1 + pgReadU32(this.buffered, 1)
     var waiting = true
-    while (waiting && (!enough || (total <= pgLargestMessage && this.buffered.size < total))) {
+    while (waiting && (!enough || (total <= maximumMessageBytes && this.buffered.size < total))) {
         val budget = if (deadline > 0) pgRemaining(deadline,timeoutMilliseconds) else timeoutMilliseconds
         if (budget <= 0) return PgMessage(0,"",false)
         val chunk = if (this.tls != 0) pgTlsAdded[0].receive(this.tls, budget)
@@ -342,7 +375,7 @@ fun PgStream.next(timeoutMilliseconds: int, deadline: int = 0): PgMessage {
         if (enough) total = 1 + pgReadU32(this.buffered, 1)
     }
     var result = PgMessage(0, "", false)
-    if (enough && total > pgLargestMessage) result = PgMessage(pgOversizedMessage, "", false)
+    if (enough && total > maximumMessageBytes) result = PgMessage(pgOversizedMessage, "", false)
     else if (enough && total >= 5 && this.buffered.size >= total) {
         result = PgMessage(
             this.buffered[0],
@@ -544,7 +577,7 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): s
     var error = ""
     if (stream.connection.descriptor < 0 && stream.tls == 0) {
         error = "Could not connect to PostgreSQL at ${config.host}:${config.port}"
-    } else if (stream.send(pgBytes(pgStartup(config))) < 0) {
+    } else if (stream.sendWithin(pgBytes(pgStartup(config)),deadline) < 0) {
         error = "Could not send PostgreSQL startup message"
     } else {
         var ready = false
@@ -554,8 +587,8 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): s
         var expectedServerSignature = ""
         var scramVerified = false
         while (!ready && error == "") {
-            val message = stream.next(config.readTimeoutMilliseconds,deadline)
-            if (!message.valid) error = "Timed out during PostgreSQL startup"
+            val message = stream.next(config.readTimeoutMilliseconds,deadline,65536)
+            if (!message.valid) error = if(message.kind==pgOversizedMessage) "PostgreSQL authentication message exceeded64KiB" else "Timed out during PostgreSQL startup"
             else if (message.kind == 69) error = pgErrorMessage(message.body)
             else if (message.kind == 82) {
                 if (message.body.size < 4) {
@@ -571,8 +604,8 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): s
                             error = "PostgreSQL requested a duplicate password response"
                         } else {
                             passwordResponseSent = true
-                            if (stream.send(
-                                pgPasswordMessage(config.password)
+                            if (stream.sendWithin(
+                                pgPasswordMessage(config.password),deadline
                             ) < 0) error = "Could not send PostgreSQL password"
                         }
                     } else if (method == 5) {
@@ -585,8 +618,8 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): s
                                 config.password,
                                 message.body.slice(4, 8)
                             )
-                            if (response == "" || stream.send(
-                                pgPasswordMessage(response)
+                            if (response == "" || stream.sendWithin(
+                                pgPasswordMessage(response),deadline
                             ) < 0) error = "Could not send PostgreSQL MD5 password response"
                         }
                     } else if (method == 10) {
@@ -603,8 +636,8 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): s
                                 clientFirstBare =
                                     "n=${pgSaslName(config.user)},r=$nonce"
                                 val initial = "n,,$clientFirstBare"
-                                if (stream.send(
-                                    pgSaslInitialMessage(initial)
+                                if (stream.sendWithin(
+                                    pgSaslInitialMessage(initial),deadline
                                 ) < 0) error = "Could not begin PostgreSQL SCRAM authentication"
                             }
                         }
@@ -621,8 +654,8 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): s
                             if (proof.error != "") error = proof.error
                             else {
                                 expectedServerSignature = proof.serverSignature
-                                if (stream.send(
-                                    pgSaslResponseMessage(proof.clientFinal)
+                                if (stream.sendWithin(
+                                    pgSaslResponseMessage(proof.clientFinal),deadline
                                 ) < 0) error = "Could not send PostgreSQL SCRAM proof"
                             }
                         }
@@ -758,7 +791,9 @@ fun PgClient.connect(): string {
         val attemptDeadline = linuxMonotonicMilliseconds()+remaining/(candidates.size-index)
         val candidate = pgCandidateConfig(this.config,candidates[index],remaining)
         val address = pgResolveCandidate(candidate.host,attemptDeadline)
-        val budget = pgRemaining(attemptDeadline,remaining)
+        // tcpConnectIpv4 accepts at most10s per dial; the full selection and
+        // authentication deadline may legitimately be longer than one dial.
+        val budget = pgRemaining(attemptDeadline,10000)
         if (address == "" || budget <= 0) error = "Could not resolve PostgreSQL candidate within connection deadline"
         else {
             this.stream = PgStream(tcpConnectIpv4(address,candidate.port,budget),"",0)
@@ -838,7 +873,7 @@ private fun PgClient.exchange(request: string, replyTimeout: int, control: int, 
         // contain arbitrary transaction boundaries, so loss is conservative.
         if ((control == 1 || control == 4) && before == pgTransactionIdle) this.transactionState = pgTransactionOpen
         sent = true
-        if (this.stream.send(request) < 0) {
+        if (this.stream.sendWithin(request,deadline) < 0) {
             error = "Could not send PostgreSQL query"
             transportFailed = true
         }

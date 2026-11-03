@@ -1,0 +1,111 @@
+import "../src/async.ab"
+import "../src/tls.ab"
+import "abla/io"
+import "abla/fs"
+import "abla/process/time"
+
+fun dripServer(): int {
+    val parent=pgInt(linuxArgument(1))
+    if(parent<=0 || linuxSyscall5(157,1,9,0,0,0)!=0 || linuxSyscall0(110)!=parent) return 2
+    linuxSyscall1(37,3)
+    val listener=tcpListenAddress(Ipv4SocketAddress("127.0.0.1",0))
+    if(listener.descriptor<0) return 3
+    println("${listener.localPort()}")
+    val peer=listener.accept()
+    if(peer.readWithTimeoutResult(8,1000).bytes.size!=8) return 4
+    if(peer.write("S")<0) return 5
+    // A syntactically plausible but incomplete TLS handshake record. Every
+    // fragment arrives before a per-read timeout could expire.
+    val bytes="\x16\x03\x03\x00\xff${"x".repeat(30)}"
+    for(index in 0 until bytes.size) {
+        if(peer.write(bytes.slice(index,index+1))<0) break
+        sleep(30)
+    }
+    peer.close()
+    0
+}
+
+fun dripCheck(usePool: bool = true): bool {
+    val parent=linuxProcessId()
+    val ready="build/tls-drip-$parent.ready"
+    val child=linuxCommand("/proc/$parent/exe").argument("drip").argument("$parent").output(ready).start()
+    val deadline=linuxMonotonicMilliseconds()+3000
+    var port=0
+    while(port<=0 && linuxMonotonicMilliseconds()<deadline) { port=pgInt(linuxReadFile(ready,64).trim()); if(port<=0) sleep(5) }
+    var fine=false
+    if(port>0) {
+        if(!usePool) {
+            val client=pgClient(PgConfig("127.0.0.1",port,"test","test","",200,2000,"require"))
+            val started=linuxMonotonicMilliseconds()
+            val result=client.query("SELECT 1")
+            client.close()
+            val elapsed=linuxMonotonicMilliseconds()-started
+            fine=!result.succeeded && elapsed>=150 && elapsed<500
+            if(!fine) println("whole TLS query/connect/close exceeded budget: $elapsed")
+        } else {
+        val pool=pgPool(PgConfig("127.0.0.1",port,"test","test","",200,2000,"require"),PgPoolOptions(1,1000,200))
+        val started=linuxMonotonicMilliseconds()
+        val id=pool.query("SELECT 1")
+        var elapsed=0
+        var maximum=0
+        var finished=false
+        while(!finished && linuxMonotonicMilliseconds()-started<1000) {
+            val before=linuxMonotonicMilliseconds()
+            pool.step(5)
+            val took=linuxMonotonicMilliseconds()-before
+            if(took>maximum) maximum=took
+            for(result in pool.takeResults()) if(result.id==id) { finished=true; fine=!result.result.succeeded }
+            elapsed=linuxMonotonicMilliseconds()-started
+        }
+        fine=fine && elapsed>=150 && elapsed<500 && maximum<100
+        if(!fine) println("TLS drip escaped its budget: elapsed=$elapsed step=$maximum")
+        pool.drop()
+        }
+    }
+    val reaped=linuxWaitProcess(child.process).status==0
+    Path(ready).remove()
+    fine && reaped
+}
+
+fun answer(var pool: PgPool, id: int): PgResult {
+    val deadline=linuxMonotonicMilliseconds()+10000
+    while(linuxMonotonicMilliseconds()<deadline) {
+        pool.step(10)
+        for(result in pool.takeResults()) if(result.id==id) return result.result
+    }
+    PgResult(false,[],[],"","async TLS result deadline")
+}
+
+fun main: int {
+    if(linuxArgument(0)=="drip") return dripServer()
+    pgTlsEnable()
+    if(!dripCheck() || !dripCheck(false)) { println("TLS drip regression failed"); return 1 }
+    val config=pgConfigFromEnvironment()
+    val pool=pgPool(config,PgPoolOptions(1,8000,3000))
+    val result=answer(pool,pool.query("SELECT ssl::text AS ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()"))
+    if(!result.succeeded) { println("refused: ${result.error}"); pool.drop(); return 1 }
+    val large=answer(pool,pool.query("SELECT repeat('x',1048576) AS data"))
+    if(!large.succeeded || large.first("data").size!=1048576) { println("large TLS read failed: ${large.error}"); pool.drop(); return 1 }
+    val small=nativeByteBuffer(4)
+    linuxNetStoreU32(small,0,4096)
+    linuxSyscall5(54,pool.connDescriptors[0],1,7,nativePointerAddress(small.address),4)
+    small.close()
+    val sent=answer(pool,pool.query("SELECT length($1)::text AS n",[pgText(large.first("data"))]))
+    if(!sent.succeeded || sent.first("n")!="1048576") { println("large backpressured TLS write failed: ${sent.error}"); pool.drop(); return 1 }
+    val tx=pool.begin()
+    if(!answer(pool,tx).succeeded || !answer(pool,pool.query("SELECT 1",[],tx)).succeeded || !answer(pool,pool.commit(tx)).succeeded) { println("TLS transaction failed"); pool.drop(); return 1 }
+    if(!answer(pool,pool.query("LISTEN abla_async_tls_test")).succeeded) { println("TLS LISTEN failed"); pool.drop(); return 1 }
+    val detached=pool.detachConnection(0)
+    pool.drop()
+    if(detached.descriptor<0 || (config.sslMode!="disable" && detached.tls==0)) { println("TLS connection transfer failed"); return 1 }
+    val writer=pgClient(config)
+    val notified=writer.query("SELECT pg_notify('abla_async_tls_test','owned-test-payload')")
+    writer.close()
+    val stream=PgStream(TcpConnection(if(detached.tls==0) detached.descriptor else -1),detached.buffered,detached.tls)
+    val message=stream.next(2000,linuxMonotonicMilliseconds()+3000)
+    if(stream.tls!=0) { pgTlsAdded[0].close(stream.tls); stream.tls=0 }
+    else stream.connection.close()
+    if(!notified.succeeded || !message.valid || message.kind!=65 || !message.body.contains("owned-test-payload")) { println("detached TLS LISTEN missed NOTIFY"); return 1 }
+    println(if(result.first("ssl")=="true") "ssl" else "plain")
+    0
+}

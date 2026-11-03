@@ -15,6 +15,93 @@ private fun pgTlsIsAddress(host: string): bool {
     true
 }
 
+trusted fun pgTlsStart(descriptor: int, host: string, mode: string, rootCert: string): int {
+    val checks = mode != "require"
+    val context = SSL_CTX_new(TLS_client_method())
+    var ready = !pointerIsNull(context)
+    if (ready) {
+        SSL_CTX_set_verify(context,if(checks) 1 else 0,nativeNullPointer())
+        if (checks) ready = (if(rootCert=="system") SSL_CTX_set_default_verify_paths(context) else SSL_CTX_load_verify_locations(context,rootCert,nativeNullPointer())) == 1
+    }
+    val session = if(ready) SSL_new(context) else nativeNullPointer()
+    ready = ready && !pointerIsNull(session)
+    // Retry contents remain identical after WANT_READ/WRITE, but Abla may
+    // materialize a new C-string buffer for that same slice on the next tick.
+    if(ready) ready = (SSL_ctrl(session,33,2,"") & 2) == 2
+    val address = pgTlsIsAddress(host)
+    if(ready && !address) ready = SSL_ctrl(session,55,0,host) == 1
+    if(ready && mode=="verify-full") ready = if(address) X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(session),host) == 1 else SSL_set1_host(session,host) == 1
+    if(ready) ready = SSL_set_fd(session,descriptor) == 1 && linuxSocketSetNonblocking(descriptor,true)
+    if(!ready) {
+        if(!pointerIsNull(session)) SSL_free(session)
+        if(!pointerIsNull(context)) SSL_CTX_free(context)
+        return 0
+    }
+    tlsAllocateConnection(context,session,descriptor,true)
+}
+
+trusted fun pgTlsHandshakeReady(handle: int): int {
+    val session = tlsControlPointer(handle,8)
+    ERR_clear_error()
+    val held = linuxBrokenPipeHold()
+    val result: int = SSL_connect(session)
+    val reason: int = SSL_get_error(session,i32(result))
+    val status = if(result==1) 1 else reason
+    linuxBrokenPipeRelease(held)
+    if(result==1) 1 else if(status==2 || status==3) status else -1
+}
+
+trusted fun pgTlsSendReady(handle: int, bytes: string, offset: int): PgTlsIo {
+    if(offset<0 || offset>=bytes.size) return PgTlsIo("",0,1)
+    val session = tlsControlPointer(handle,8)
+    val count = if(bytes.size-offset>1048576) 1048576 else bytes.size-offset
+    ERR_clear_error()
+    val held = linuxBrokenPipeHold()
+    val sent: int = SSL_write(session,bytes.slice(offset,offset+count),i32(count))
+    val reason: int = SSL_get_error(session,i32(sent))
+    val status = if(sent>0) 1 else reason
+    linuxBrokenPipeRelease(held)
+    PgTlsIo("",if(sent>0) sent else 0,if(sent>0) 1 else if(status==2 || status==3) status else -1)
+}
+
+trusted fun pgTlsReadReady(handle: int, maximum: int): PgTlsIo {
+    val buffer = nativeByteBuffer(maximum)
+    val session = tlsControlPointer(handle,8)
+    ERR_clear_error()
+    val held = linuxBrokenPipeHold()
+    val count: int = SSL_read(session,buffer.address,i32(maximum))
+    val reason: int = SSL_get_error(session,i32(count))
+    val status = if(count>0) 1 else reason
+    linuxBrokenPipeRelease(held)
+    if(count>0) return PgTlsIo(buffer.adoptString(count),count,1)
+    buffer.close()
+    PgTlsIo("",0,if(status==2 || status==3) status else if(status==6) 0 else -1)
+}
+
+trusted fun pgTlsSendUntil(handle: int, bytes: string, deadline: int): int {
+    val descriptor=tlsControlInt(handle,16)
+    if(!linuxSocketSetNonblocking(descriptor,true)) return -1
+    // SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER for identical slices across retries.
+    SSL_ctrl(tlsControlPointer(handle,8),33,2,"")
+    var offset=0
+    var healthy=true
+    while(healthy && offset<bytes.size && linuxMonotonicMilliseconds()<deadline) {
+        val sent=pgTlsSendReady(handle,bytes,offset)
+        if(sent.written>0) offset=offset+sent.written
+        if(sent.status<0 || sent.status==0) healthy=false
+        else if(offset<bytes.size && (sent.status==2 || sent.status==3)) {
+            val budget=pgRemaining(deadline,10000)
+            if(budget<=0) healthy=false
+            else {
+                val polled=linuxPollSocket(descriptor,sent.status==2,sent.status==3,budget)
+                if(polled.timedOut || polled.closed || polled.errorCode!=0) healthy=false
+            }
+        }
+    }
+    linuxSocketSetNonblocking(descriptor,false)
+    if(healthy && offset==bytes.size) offset else -1
+}
+
 // As stdlib's tlsUpgrade, which always checks the name: what is checked follows the mode. An address is checked as one,
 // which is what a certificate's IP entries are for, and isn't sent as a server name, as RFC 6066 has only names there.
 trusted fun pgTlsHandshake(var connection: TcpConnection, host: string, mode: string, rootCert: string, timeoutMilliseconds: int): int {
@@ -109,6 +196,11 @@ trusted fun pgTlsReceive(handle: int, timeoutMilliseconds: int): string {
 }
 
 class PgOpenSsl() : PgTls {
+    fun start(descriptor: int, host: string, mode: string, rootCert: string): int = pgTlsStart(descriptor,host,mode,rootCert)
+    fun handshake(handle: int): int = pgTlsHandshakeReady(handle)
+    fun sendReady(handle: int, bytes: string, offset: int): PgTlsIo = pgTlsSendReady(handle,bytes,offset)
+    fun receiveReady(handle: int, maximum: int): PgTlsIo = pgTlsReadReady(handle,maximum)
+    fun sendUntil(handle: int, bytes: string, deadline: int): int = pgTlsSendUntil(handle,bytes,deadline)
     fun upgrade(var connection: TcpConnection, host: string, mode: string, rootCert: string, timeoutMilliseconds: int): int =
         pgTlsHandshake(connection, host, mode, rootCert, timeoutMilliseconds)
     fun failure(): string = "the handshake failed, or the server's certificate isn't what was asked for"
@@ -120,6 +212,10 @@ class PgOpenSsl() : PgTls {
     }
     fun receive(handle: int, timeoutMilliseconds: int): string = pgTlsReceive(handle,timeoutMilliseconds)
     fun close(handle: int): void {
+        // SSL_shutdown may otherwise block after a failed bounded operation
+        // restored blocking mode. Teardown sends close_notify best-effort only.
+        val descriptor=tlsControlInt(handle,16)
+        if(!linuxSocketSetNonblocking(descriptor,true)) linuxSyscall2(48,descriptor,2)
         var connection = TlsConnection(handle)
         connection.close()
         return

@@ -92,7 +92,7 @@ run_mode() {
             -e POSTGRES_DB=abla_test -p 127.0.0.1::5432 postgres:16-alpine >/dev/null
         reader_port=$(docker port "$reader" 5432/tcp | sed 's/.*://')
         attempt=0
-        until docker exec "$reader" pg_isready -U postgres -d abla_test >/dev/null 2>&1; do
+        until docker exec "$reader" pg_isready -h 127.0.0.1 -U postgres -d abla_test >/dev/null 2>&1; do
             attempt=$((attempt+1))
             if [ "$attempt" -ge 30 ]; then exit 1; fi
             sleep 1
@@ -111,14 +111,17 @@ run_mode() {
     echo "abla-postgres: $mode authentication passed"
 }
 
-run_mode trust scram-sha-256
-run_mode password scram-sha-256
-run_mode md5 md5
-run_mode scram-sha-256 scram-sha-256
+if [ "${PG_TEST_TLS_ONLY:-}" != 1 ]; then
+    run_mode trust scram-sha-256
+    run_mode password scram-sha-256
+    run_mode md5 md5
+    run_mode scram-sha-256 scram-sha-256
+fi
 
 # What asks for TLS gets it, checked as asked, or a refusal: never a plain connection.
 run_tls() {
     "$compiler" build "$project_dir/tests/tls_test.ab" -o "$project_dir/build/tls-test" --fast --no-cache
+    "$compiler" build "$project_dir/tests/async_tls_test.ab" -o "$project_dir/build/async-tls-test" --fast --no-cache
     "$compiler" build "$project_dir/tests/no_tls_test.ab" -o "$project_dir/build/no-tls-test" --fast --no-cache
     "$project_dir/build/no-tls-test" >/dev/null
     if ldd "$project_dir/build/no-tls-test" | grep -q ssl; then echo 'a program without the tls subpath links OpenSSL'; exit 1; fi
@@ -141,11 +144,13 @@ run_tls() {
     port=$(docker port "$container" 5432/tcp | sed 's/.*://')
     until docker exec "$container" pg_isready -h 127.0.0.1 -U postgres -d abla_test >/dev/null 2>&1; do sleep 1; done
     expect() { # WHAT SSLMODE ROOT HOST
-        got=$(POSTGRES_HOST="$4" POSTGRES_PORT="$port" POSTGRES_DB=abla_test POSTGRES_USER=postgres POSTGRES_SSLMODE="$2" POSTGRES_SSLROOTCERT="$3" "$project_dir/build/tls-test" 2>&1 || true)
-        case "$got" in
-            $1*) echo "ok   $2 $4 ${3##*/}: $1" ;;
-            *) echo "FAIL $2 $4 ${3##*/}: wanted $1, got $got"; exit 1 ;;
-        esac
+        for program in tls-test async-tls-test; do
+            got=$(POSTGRES_HOST="$4" POSTGRES_PORT="$port" POSTGRES_DB=abla_test POSTGRES_USER=postgres POSTGRES_SSLMODE="$2" POSTGRES_SSLROOTCERT="$3" "$project_dir/build/$program" 2>&1 || true)
+            case "$got" in
+                $1*) echo "ok   $program $2 $4 ${3##*/}: $1" ;;
+                *) echo "FAIL $program $2 $4 ${3##*/}: wanted $1, got $got"; exit 1 ;;
+            esac
+        done
     }
     # With TLS off on the server.
     expect plain disable '' 127.0.0.1
