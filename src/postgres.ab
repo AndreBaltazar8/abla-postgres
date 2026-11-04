@@ -191,12 +191,7 @@ class PgSessionResult(
 
 fun pgDisconnectedStream(): PgStream = PgStream(TcpConnection(-1), "", 0)
 
-fun pgClient(config: PgConfig): PgClient = PgClient(
-    config,
-    pgDisconnectedStream(),
-    false,
-    pgTransactionIdle
-)
+fun pgClient(config: PgConfig): PgClient = PgClient(config, pgDisconnectedStream(), false)
 
 fun pgEnvironment(name: string, fallback: string): string {
     val configured = linuxEnvironment(name)
