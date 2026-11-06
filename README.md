@@ -10,6 +10,18 @@ is replayed during failover. `pgConfigWithTimeouts` retains this policy when
 giving a checkpoint connection a separate budget. The bounded connector uses
 IPv4/DNS and `/etc/hosts`, without invoking arbitrary blocking NSS resolvers.
 
+For an SSH tunnel, the optional trailing `PgConfig.hostAddress` can set an
+IPv4 TCP destination while `host` stays the logical DNS name used by verify-full
+TLS and SNI. For example, use `host="pg.example.test"`, `port=55472`,
+`hostAddress="127.0.0.1"`, `sslMode="verify-full"` and the server CA.
+The override accepts exactly one logical host and a numeric IPv4 address;
+malformed addresses, IPv6 and multi-host overrides are refused. Empty (the
+default) retains ordinary resolution and multi-host behavior. Sync clients,
+async pools and timeout/candidate copies preserve this separation; an explicit
+override takes precedence over an async off-loop address cache. No TLS policy
+is weakened, and this constructor field does not introduce an ambient
+`PGHOSTADDR` environment override.
+
 Abla Postgres is a PostgreSQL client written in
 [Abla](https://github.com/AndreBaltazar8/ablac) for Abla Linux services. It
 speaks the PostgreSQL v3 wire protocol directly, so applications do not need

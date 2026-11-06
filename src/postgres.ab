@@ -24,7 +24,10 @@ class PgConfig(
     // The CA file of verify-ca and verify-full, or "system".
     val sslRootCert: string = "",
     // A candidate must prove it is writable before application SQL is sent.
-    val targetSessionAttrs: string = "read-write"
+    val targetSessionAttrs: string = "read-write",
+    // Optional IPv4 TCP destination for one logical host (for example an SSH tunnel).
+    // TLS still verifies host; this never changes the certificate identity.
+    val hostAddress: string = ""
 )
 
 // Keep connection policy when giving a dedicated checkpoint/lease session its
@@ -32,13 +35,29 @@ class PgConfig(
 // host-selection policy is added.
 fun pgConfigWithTimeouts(config: PgConfig, connectMilliseconds: int, readMilliseconds: int): PgConfig = PgConfig(
     config.host,config.port,config.database,config.user,config.password,
-    connectMilliseconds,readMilliseconds,config.sslMode,config.sslRootCert,config.targetSessionAttrs
+    connectMilliseconds,readMilliseconds,config.sslMode,config.sslRootCert,config.targetSessionAttrs,config.hostAddress
 )
 
 class PgCandidate(val host: string, val port: int)
 
+fun pgHostAddressValid(address: string): bool {
+    val parts=address.split(".")
+    if(parts.size!=4) return false
+    for(part in parts) {
+        if(part.size==0 || part.size>3 || (part.size>1 && part[0]==48)) return false
+        var number=0
+        for(b in part) {
+            if(b<48 || b>57) return false
+            number=number*10+b-48
+        }
+        if(number>255) return false
+    }
+    true
+}
+
 fun pgCandidates(config: PgConfig): array<PgCandidate> {
     val out: array<PgCandidate> = []
+    if (config.hostAddress != "" && !pgHostAddressValid(config.hostAddress)) return []
     for (part in config.host.split(",")) {
         val text = part.trim()
         val pieces = text.split(":")
@@ -47,12 +66,13 @@ fun pgCandidates(config: PgConfig): array<PgCandidate> {
         if (host == "" || pieces.size > 2 || port <= 0 || port > 65535 || out.size >= 32) return []
         out.append(PgCandidate(host,port))
     }
+    if (config.hostAddress != "" && out.size != 1) return []
     out
 }
 
 fun pgCandidateConfig(config: PgConfig, candidate: PgCandidate, connectMilliseconds: int): PgConfig = PgConfig(
     candidate.host,candidate.port,config.database,config.user,config.password,
-    connectMilliseconds,config.readTimeoutMilliseconds,config.sslMode,config.sslRootCert,config.targetSessionAttrs
+    connectMilliseconds,config.readTimeoutMilliseconds,config.sslMode,config.sslRootCert,config.targetSessionAttrs,config.hostAddress
 )
 
 fun pgRemaining(deadline: int, maximum: int): int {
@@ -785,7 +805,7 @@ fun PgClient.connect(): string {
         // Reserve a fair part of the one total deadline for later candidates.
         val attemptDeadline = linuxMonotonicMilliseconds()+remaining/(candidates.size-index)
         val candidate = pgCandidateConfig(this.config,candidates[index],remaining)
-        val address = pgResolveCandidate(candidate.host,attemptDeadline)
+        val address = if (candidate.hostAddress != "") candidate.hostAddress else pgResolveCandidate(candidate.host,attemptDeadline)
         // tcpConnectIpv4 accepts at most10s per dial; the full selection and
         // authentication deadline may legitimately be longer than one dial.
         val budget = pgRemaining(attemptDeadline,10000)

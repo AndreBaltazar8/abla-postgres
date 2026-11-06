@@ -5,6 +5,8 @@ COMPILER := $(ABLAC)
 
 check:
 	mkdir -p build
+	$(COMPILER) build tests/host_address_test.ab -o build/host-address-test --fast --no-cache
+	build/host-address-test
 	$(COMPILER) build tests/crypto_test.ab -o build/crypto-test --fast --no-cache
 	build/crypto-test
 	$(COMPILER) build tests/protocol_test.ab -o build/protocol-test --fast --no-cache

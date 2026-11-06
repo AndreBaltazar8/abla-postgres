@@ -14,6 +14,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "$project_dir/build"
+"$compiler" build "$project_dir/tests/host_address_test.ab" -o "$project_dir/build/host-address-test" --fast --no-cache
+"$project_dir/build/host-address-test"
 "$compiler" build "$project_dir/tests/protocol_test.ab" \
     -o "$project_dir/build/protocol-test" --fast --no-cache
 "$compiler" build "$project_dir/tests/auth_failure_test.ab" \
@@ -137,6 +139,7 @@ run_tls() {
     done
     cert server ca DNS:localhost
     cert address ca IP:127.0.0.1
+    cert tunnel ca DNS:pg-tunnel.example.test
 
     container="abla-postgres-tls-$$"
     containers="$containers $container"
@@ -145,7 +148,7 @@ run_tls() {
     until docker exec "$container" pg_isready -h 127.0.0.1 -U postgres -d abla_test >/dev/null 2>&1; do sleep 1; done
     expect() { # WHAT SSLMODE ROOT HOST
         for program in tls-test async-tls-test; do
-            got=$(POSTGRES_HOST="$4" POSTGRES_PORT="$port" POSTGRES_DB=abla_test POSTGRES_USER=postgres POSTGRES_SSLMODE="$2" POSTGRES_SSLROOTCERT="$3" "$project_dir/build/$program" 2>&1 || true)
+            got=$(POSTGRES_HOST="$4" POSTGRES_PORT="$port" POSTGRES_DB=abla_test POSTGRES_USER=postgres POSTGRES_SSLMODE="$2" POSTGRES_SSLROOTCERT="$3" PG_TEST_HOST_ADDRESS="${5:-}" "$project_dir/build/$program" 2>&1 || true)
             case "$got" in
                 $1*) echo "ok   $program $2 $4 ${3##*/}: $1" ;;
                 *) echo "FAIL $program $2 $4 ${3##*/}: wanted $1, got $got"; exit 1 ;;
@@ -176,6 +179,12 @@ run_tls() {
     expect refused verify-ca '' localhost
     expect refused verify-ca "$work/missing.pem" localhost
     expect refused nonsense '' localhost
+    use tunnel
+    expect ssl verify-full "$work/ca.pem" pg-tunnel.example.test 127.0.0.1
+    expect refused verify-full "$work/ca.pem" wrong-tunnel.example.test 127.0.0.1
+    expect refused verify-full "$work/other.pem" pg-tunnel.example.test 127.0.0.1
+    expect refused verify-full "$work/ca.pem" pg-tunnel.example.test localhost
+    expect refused verify-full "$work/ca.pem" 'pg-tunnel.example.test,localhost' 127.0.0.1
     use address
     expect ssl verify-full "$work/ca.pem" 127.0.0.1
     expect refused verify-full "$work/ca.pem" localhost

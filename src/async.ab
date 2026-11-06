@@ -482,7 +482,8 @@ fun PgPool.openConnection(): int {
         deadline = linuxMonotonicMilliseconds()+remaining/(candidates.size-this.candidateIndex)
         val candidate = candidates[this.candidateIndex]
         if (this.address == "") {
-            if(this.resolvedCandidates.size>0) this.address=if(this.candidateIndex<this.resolvedCandidates.size) this.resolvedCandidates[this.candidateIndex] else ""
+            if(this.config.hostAddress!="") this.address=this.config.hostAddress
+            else if(this.resolvedCandidates.size>0) this.address=if(this.candidateIndex<this.resolvedCandidates.size) this.resolvedCandidates[this.candidateIndex] else ""
             else if(linuxIpv4Octets(candidate.host).size==4) this.address=candidate.host
             else if(candidate.host=="localhost") this.address="127.0.0.1"
             else this.lastConnectError="Async PostgreSQL host names require resolvedCandidates from an off-loop resolver"

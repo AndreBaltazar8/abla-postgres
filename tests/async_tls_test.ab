@@ -80,7 +80,8 @@ fun main: int {
     if(linuxArgument(0)=="drip") return dripServer()
     pgTlsEnable()
     if(!dripCheck() || !dripCheck(false)) { println("TLS drip regression failed"); return 1 }
-    val config=pgConfigFromEnvironment()
+    val base=pgConfigFromEnvironment()
+    val config=PgConfig(base.host,base.port,base.database,base.user,base.password,base.connectTimeoutMilliseconds,base.readTimeoutMilliseconds,base.sslMode,base.sslRootCert,base.targetSessionAttrs,pgEnvironment("PG_TEST_HOST_ADDRESS",""))
     val pool=pgPool(config,PgPoolOptions(1,8000,3000))
     val result=answer(pool,pool.query("SELECT ssl::text AS ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()"))
     if(!result.succeeded) { println("refused: ${result.error}"); pool.drop(); return 1 }

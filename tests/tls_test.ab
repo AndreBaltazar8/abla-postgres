@@ -5,7 +5,8 @@ import "../src/tls.ab"
 
 fun main: int {
     pgTlsEnable()
-    val config = pgConfigFromEnvironment()
+    val base=pgConfigFromEnvironment()
+    val config=PgConfig(base.host,base.port,base.database,base.user,base.password,base.connectTimeoutMilliseconds,base.readTimeoutMilliseconds,base.sslMode,base.sslRootCert,base.targetSessionAttrs,pgEnvironment("PG_TEST_HOST_ADDRESS",""))
     val asked = pgQuery(config, "SELECT ssl::text AS ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()")
     if (!asked.succeeded) {
         println("refused: ${asked.error}")

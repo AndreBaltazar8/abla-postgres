@@ -1,0 +1,26 @@
+import "../src/postgres.ab"
+import "abla/io"
+var failures=0
+var checks=0
+fun check(ok: bool,name: string): void {
+    checks=checks+1
+    if(!ok) failures=failures+1
+    println("${if(ok) "ok" else "FAIL"} $name")
+    return
+}
+fun main: int {
+    val base=PgConfig("pg-tunnel.example.test",5432,"test","test","",3000,5000,"verify-full","/synthetic/ca","any","127.0.0.1")
+    val candidates=pgCandidates(base)
+    check(candidates.size==1 && candidates[0].host=="pg-tunnel.example.test","one logical TLS host survives numeric TCP override")
+    val budget=pgConfigWithTimeouts(base,100,200)
+    check(budget.hostAddress=="127.0.0.1" && budget.host==base.host && budget.sslMode=="verify-full" && budget.sslRootCert==base.sslRootCert && budget.targetSessionAttrs=="any","budget copies preserve TCP override and certificate identity")
+    val selected=pgCandidateConfig(base,PgCandidate(base.host,6543),500)
+    check(selected.hostAddress==base.hostAddress && selected.host==base.host && selected.port==6543 && selected.sslMode==base.sslMode,"candidate copies preserve separate logical name and TCP address")
+    check(pgCandidates(PgConfig("localhost,127.0.0.1",5432,"test","test","",3000,5000,"verify-full","ca","any","127.0.0.1")).size==0,"override refuses multiple logical hosts")
+    for(address in ["localhost","127.0.0.01","127.0.0.1:5432","1.2.3.999","::1","1.2.3","1..2.3"," 127.0.0.1","127.0.0.1 ","127.0.0.x","1.2.3.4x"]) {
+        check(pgCandidates(PgConfig("pg-tunnel.example.test",5432,"test","test","",3000,5000,"verify-full","ca","any",address)).size==0,"non-literal or malformed TCP override refused")
+    }
+    check(pgCandidates(PgConfig("localhost,127.0.0.1",5432,"test","test","")).size==2,"empty default retains ordered multi-host behavior")
+    println("hostAddress: $checks checks, $failures failures")
+    if(failures==0) 0 else 1
+}
