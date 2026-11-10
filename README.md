@@ -177,6 +177,23 @@ boundaries; raw boundary SQL through `pool.query()` is refused. After connection
 loss, `ROLLBACK AND CHAIN` is refused rather than claiming a new transaction
 started on a missing connection; use a simple rollback/reset, then a fresh BEGIN.
 
+### Pipelines
+
+`client.pipeline(statements, parameters)` (or `pgSessionPipeline` on the
+session bridge) sends several statements and one Sync, so they cost one round
+trip. PostgreSQL runs them in order until one fails and skips the rest; the
+result is the last statement's, or the first failure. A pipeline may start a
+transaction only with its first statement, and only while none is open; it
+cannot end one. So `["BEGIN", "SELECT … FOR SHARE"]` opens a transaction and
+takes the lock together, and a refused BEGIN means the statement never ran
+(the session stays idle). A lost reply leaves the client lost, exactly like a
+lost BEGIN, never autocommitted. Settings made by an earlier statement
+(`set_config`) hold for the later ones.
+
+```abla
+val opened = client.pipeline(["BEGIN", "SELECT id FROM organizations WHERE id=\$1::uuid FOR SHARE"], [[], [pgText(org)]])
+```
+
 Use `pgNull()` for a SQL null value:
 
 ```abla

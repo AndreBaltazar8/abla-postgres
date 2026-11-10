@@ -22,6 +22,8 @@ mkdir -p "$project_dir/build"
     -o "$project_dir/build/auth-failure-test" --fast --no-cache
 "$compiler" build "$project_dir/tests/transaction_test.ab" \
     -o "$project_dir/build/transaction-test" --fast --no-cache
+"$compiler" build "$project_dir/tests/pipeline_test.ab" \
+    -o "$project_dir/build/pipeline-test" --fast --no-cache
 "$compiler" build "$project_dir/tests/async_test.ab" \
     -o "$project_dir/build/async-test" --fast --no-cache
 "$compiler" build "$project_dir/tests/hosts_test.ab" \
@@ -71,6 +73,10 @@ run_mode() {
     POSTGRES_HOST=127.0.0.1 POSTGRES_PORT="$port" POSTGRES_DB=abla_test \
     POSTGRES_USER=postgres POSTGRES_PASSWORD="$password" \
         "$project_dir/build/transaction-test"
+
+    POSTGRES_HOST=127.0.0.1 POSTGRES_PORT="$port" POSTGRES_DB=abla_test \
+    POSTGRES_USER=postgres POSTGRES_PASSWORD="$password" \
+        "$project_dir/build/pipeline-test"
 
     if [ "$mode" != trust ]; then
         # The existing pool regression uses42 as its successful process result.

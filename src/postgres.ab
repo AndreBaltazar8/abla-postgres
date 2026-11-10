@@ -742,6 +742,13 @@ fun pgParseRow(body: string): array<PgValue> {
 }
 
 fun pgExtendedQuery(sql: string, parameters: array<PgParameter>): string {
+    val empty: array<int> = []
+    "${pgExtendedStatement(sql, parameters)}${pgTypedMessage(83, empty)}"
+}
+
+// Parse, Bind, Describe and Execute of one unnamed statement, without the Sync
+// that ends a pipeline: several of these and one Sync are one round trip.
+fun pgExtendedStatement(sql: string, parameters: array<PgParameter>): string {
     val parse: array<int> = []
     parse.append(0)
     pgAppendCString(parse, sql)
@@ -770,13 +777,11 @@ fun pgExtendedQuery(sql: string, parameters: array<PgParameter>): string {
 
     val describe: array<int> = [80, 0]
     val execute: array<int> = [0, 0, 0, 0, 0]
-    val empty: array<int> = []
     val parsed = pgTypedMessage(80, parse)
     val bound = pgTypedMessage(66, bind)
     val described = pgTypedMessage(68, describe)
     val executed = pgTypedMessage(69, execute)
-    val synced = pgTypedMessage(83, empty)
-    "$parsed$bound$described$executed$synced"
+    "$parsed$bound$described$executed"
 }
 
 fun PgClient.disconnect(): void {
@@ -842,6 +847,41 @@ fun PgClient.query(
     this.exchange(pgExtendedQuery(sql, parameters), replyTimeout, pgTransactionControl(sql))
 }
 
+// Statements sent together and answered in one round trip: the extended
+// protocol runs them in order until one fails, skips the rest, and answers the
+// one Sync. The result is the last statement's; an earlier failure is the
+// result instead, so a failed BEGIN means the statement never ran. Only the
+// first may start a transaction, and only when none is open: a BEGIN later in
+// the list, or a pipeline that starts one inside a transaction, is refused
+// before anything is sent. A pipeline that starts a transaction and loses its
+// reply leaves the client lost (never autocommitted), as a lost BEGIN does.
+fun PgClient.pipeline(
+    statements: array<string>,
+    parameters: array<array<PgParameter>>,
+    timeoutMilliseconds: int = 0
+): PgResult {
+    if (statements.size == 0 || statements.size != parameters.size) return PgResult(false,[],[],"","A pipeline needs one parameter list per statement")
+    var control = 0
+    var request = ""
+    var index = 0
+    while (index < statements.size) {
+        val kind = pgTransactionControl(statements[index])
+        if (kind != 0 && (index != 0 || kind != 1 || statements.size == 1)) return PgResult(false,[],[],"","A pipeline may only start with BEGIN and may not end or roll back a transaction")
+        if (kind == 1) control = 1
+        request = "$request${pgExtendedStatement(statements[index], parameters[index])}"
+        index = index + 1
+    }
+    if (control == 1 && this.transactionState != pgTransactionIdle) return PgResult(false,[],[],"","A transaction is already open; a pipeline cannot begin another","25001")
+    val empty: array<int> = []
+    this.exchange(
+        "$request${pgTypedMessage(83, empty)}",
+        if (timeoutMilliseconds > 0) timeoutMilliseconds else this.config.readTimeoutMilliseconds,
+        control,
+        0,
+        statements.size
+    )
+}
+
 // Several statements in one string, as in a migration file, through the simple
 // query protocol: no parameters, and one transaction unless the text has its
 // own. The first error stops the rest. The connection is then still inside any
@@ -861,7 +901,7 @@ fun PgClient.script(
     )
 }
 
-private fun PgClient.exchange(request: string, replyTimeout: int, control: int, deadline: int = 0): PgResult {
+private fun PgClient.exchange(request: string, replyTimeout: int, control: int, deadline: int = 0, statements: int = 1): PgResult {
     val before = this.transactionState
     if (before == pgTransactionLost || before == pgTransactionUnknown) {
         val unknown = before == pgTransactionUnknown
@@ -882,6 +922,8 @@ private fun PgClient.exchange(request: string, replyTimeout: int, control: int, 
     var sqlState = ""
     var transportFailed = false
     var sent = false
+    // Statements of a pipeline that completed: only the last one's rows are kept.
+    var completed = 0
     if (error == "") {
         // Record a possible BEGIN before sending it: losing its ReadyForQuery
         // must not make the next statement an autocommitted write. A script may
@@ -919,6 +961,8 @@ private fun PgClient.exchange(request: string, replyTimeout: int, control: int, 
         } else if (message.kind == 67 && message.body.size > 0 &&
             error == "") {
             command = message.body.slice(0, message.body.size - 1)
+            completed = completed + 1
+            if (completed < statements) { columns.clear(); rows.clear() }
         } else if (message.kind == 90) {
             if (message.body.size != 1 || (message.body[0] != 73 && message.body[0] != 84 && message.body[0] != 69)) {
                 error = "PostgreSQL sent an invalid transaction state"
@@ -990,6 +1034,30 @@ fun pgSessionQuery(
         PgSessionState(nextDescriptor,nextBuffered,client.transactionState),
         result
     )
+}
+
+// The session bridge of PgClient.pipeline, with the same ownership rules as
+// pgSessionQuery.
+fun pgSessionPipeline(
+    config: PgConfig,
+    state: PgSessionState,
+    statements: array<string>,
+    parameters: array<array<PgParameter>>,
+    timeoutMilliseconds: int = 0
+): PgSessionResult {
+    val descriptor = state.descriptor
+    val client = PgClient(
+        config,
+        if (descriptor >= pgSessionTls) PgStream(TcpConnection(-1), state.buffered, descriptor - pgSessionTls)
+        else PgStream(TcpConnection(descriptor), state.buffered, 0),
+        descriptor >= 0,
+        state.transactionState
+    )
+    val result = client.pipeline(statements, parameters, timeoutMilliseconds)
+    val nextDescriptor = if (client.stream.tls != 0) pgSessionTls + client.stream.tls else client.stream.connection.descriptor
+    val nextBuffered = client.stream.buffered
+    client.stream.connection.descriptor = -1
+    PgSessionResult(PgSessionState(nextDescriptor,nextBuffered,client.transactionState), result)
 }
 
 fun pgQuery(

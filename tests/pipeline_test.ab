@@ -1,0 +1,197 @@
+import "../src/postgres.ab"
+import "abla/io"
+import "abla/fs"
+import "abla/sys/linux"
+import "abla/process/time"
+
+// PgClient.pipeline: statements answered in one round trip. A fake server proves the round trip and a lost
+// reply; a real PostgreSQL (tools/test-postgres.sh) proves what runs and the transaction state afterwards.
+var failures = 0
+var checks = 0
+fun check(ok: bool, name: string): void {
+    checks = checks + 1
+    println("${if (ok) "ok" else "FAIL"} $name")
+    if (!ok) failures = failures + 1
+    return
+}
+
+fun commandComplete(tag: string): string {
+    val body: array<int> = []
+    pgAppendCString(body, tag)
+    pgTypedMessage(67, body)
+}
+fun oneTextColumn(name: string): string {
+    val body: array<int> = []
+    pgAppendU16(body, 1)
+    pgAppendCString(body, name)
+    pgAppendU32(body, 0)
+    pgAppendU16(body, 0)
+    pgAppendU32(body, 25)
+    pgAppendU16(body, 65535)
+    pgAppendU32(body, 4294967295)
+    pgAppendU16(body, 0)
+    pgTypedMessage(84, body)
+}
+fun oneTextRow(value: string): string {
+    val body: array<int> = []
+    pgAppendU16(body, 1)
+    pgAppendU32(body, value.size)
+    pgAppendText(body, value)
+    pgTypedMessage(68, body)
+}
+
+// pipeline-one-sync: answers only after the single Sync, and exits 0 only if both statements came before it.
+// pipeline-lost: answers BEGIN, then the socket closes before the statement's answer and ReadyForQuery.
+fun fakeServer(): int {
+    val parent=pgInt(linuxArgument(1))
+    if (parent<=0 || linuxSyscall5(157,1,9,0,0,0)!=0 || linuxSyscall0(110)!=parent) return 2
+    linuxSyscall1(37,3)
+    val listener=tcpListenAddress(Ipv4SocketAddress("127.0.0.1",0))
+    if (listener.descriptor<0) return 3
+    println("${listener.localPort()}")
+    val stream=PgStream(listener.accept(),"",0)
+    var startup=""
+    while (startup.size<4) {
+        val got=stream.connection.readWithTimeoutResult(4096,1000).bytes
+        if (got=="") return 4
+        startup="$startup$got"
+    }
+    val size=pgReadU32(startup,0)
+    if (size<8 || size>4096) return 5
+    while (startup.size<size) {
+        val got=stream.connection.readWithTimeoutResult(4096,1000).bytes
+        if (got=="") return 6
+        startup="$startup$got"
+    }
+    stream.buffered=startup.slice(size,startup.size)
+    stream.send("${pgTypedMessage(82,[0,0,0,0])}${pgTypedMessage(90,[73])}")
+    var parses=0
+    var synced=false
+    while (!synced) {
+        val message=stream.next(1000)
+        if (!message.valid) return 7
+        if (message.kind==80) parses=parses+1
+        synced=message.kind==83
+    }
+    val begun="${pgTypedMessage(49,[])}${pgTypedMessage(50,[])}${pgTypedMessage(110,[])}${commandComplete("BEGIN")}"
+    if (linuxArgument(0)=="pipeline-lost") {
+        stream.send(begun)
+        stream.connection.close()
+        return 0
+    }
+    stream.send("$begun${pgTypedMessage(49,[])}${pgTypedMessage(50,[])}${oneTextColumn("n")}${oneTextRow("7")}${commandComplete("SELECT 1")}${pgTypedMessage(90,[84])}")
+    // The client's ROLLBACK, so it ends idle.
+    synced=false
+    while (!synced) {
+        val message=stream.next(1000)
+        if (!message.valid) return 8
+        synced=message.kind==83
+    }
+    stream.send("${commandComplete("ROLLBACK")}${pgTypedMessage(90,[73])}")
+    stream.connection.close()
+    if (parses==2) 0 else 9
+}
+
+class Fake(val process: int, val port: int, val ready: string)
+fun fakeStart(mode: string): Fake {
+    val parent=linuxProcessId()
+    val ready="build/$mode-$parent.ready"
+    val child=linuxCommand("/proc/$parent/exe").argument(mode).argument("$parent").output(ready).start()
+    if (child.process<=0) { check(false,"$mode fixture launched"); return Fake(0,0,ready) }
+    val deadline=linuxMonotonicMilliseconds()+3000
+    var port=0
+    while (port<=0 && linuxMonotonicMilliseconds()<deadline) {
+        port=pgInt(linuxReadFile(ready,64).trim())
+        if (port<=0) sleep(10)
+    }
+    check(port>0,"$mode fixture ready")
+    Fake(child.process,port,ready)
+}
+fun fakeEnd(fake: Fake, mode: string): void {
+    if (fake.process>0) check(linuxWaitProcess(fake.process).status==0,"$mode fixture saw what it expects and exited")
+    Path(fake.ready).remove()
+    return
+}
+fun fakeConfig(port: int): PgConfig = PgConfig("127.0.0.1",port,"test","test","",300,300,"disable","","any")
+
+fun fakeChecks(): void {
+    val one=fakeStart("pipeline-one-sync")
+    if (one.port>0) {
+        var client=pgClient(fakeConfig(one.port))
+        val result=client.pipeline(["BEGIN","SELECT 7 AS n"],[[],[]])
+        check(result.succeeded && result.first("n")=="7" && result.columns.size==1 && client.transactionState==pgTransactionOpen,"P1 BEGIN and the statement answered after one Sync, the statement's row only")
+        check(client.query("ROLLBACK").succeeded && client.transactionState==pgTransactionIdle,"P1 the pipelined transaction rolls back")
+        client.close()
+    }
+    fakeEnd(one,"pipeline-one-sync")
+    val lost=fakeStart("pipeline-lost")
+    if (lost.port>0) {
+        var client=pgClient(fakeConfig(lost.port))
+        val result=client.pipeline(["BEGIN","INSERT INTO marker VALUES(1)"],[[],[]])
+        check(!result.succeeded && !result.outcomeUnknown && client.transactionState==pgTransactionLost,"P4 a reply lost after BEGIN leaves the client lost, not idle or unknown")
+        check(client.stream.connection.descriptor<0,"P4 the connection is discarded")
+        check(!client.query("SELECT 1").succeeded && client.transactionState==pgTransactionLost,"P4 nothing runs outside the lost transaction")
+        check(client.query("ROLLBACK").succeeded && client.transactionState==pgTransactionIdle,"P4 an explicit rollback resets it")
+        client.close()
+    }
+    fakeEnd(lost,"pipeline-lost")
+    return
+}
+
+fun marked(var admin: PgClient, id: int): string = admin.query("SELECT count(*)::text AS n FROM abla_pipeline_marker WHERE id=$1::int",[pgText("$id")]).first("n")
+
+fun realChecks(): void {
+    val config=pgConfigFromEnvironment()
+    var admin=pgClient(config)
+    check(admin.script("CREATE TABLE IF NOT EXISTS abla_pipeline_marker(id int PRIMARY KEY); DELETE FROM abla_pipeline_marker").succeeded,"private marker table")
+    var client=pgClient(config)
+    val both=client.pipeline(["BEGIN","INSERT INTO abla_pipeline_marker VALUES(1) RETURNING id::text"],[[],[]])
+    check(both.succeeded && both.first("id")=="1" && client.transactionState==pgTransactionOpen,"P1 real: inside the transaction BEGIN opened, with the statement's row")
+    check(client.query("COMMIT").succeeded && marked(admin,1)=="1","P1 real: committed like any transaction")
+
+    val refused=client.pipeline(["BEGIN ISOLATION LEVEL NONSENSE","INSERT INTO abla_pipeline_marker VALUES(2)"],[[],[]])
+    check(!refused.succeeded && client.transactionState==pgTransactionIdle,"P2 a refused BEGIN leaves the session idle")
+    check(marked(admin,2)=="0","P2 the statement after a refused BEGIN did not run")
+    check(client.query("SELECT 1 AS one").first("one")=="1","P2 the connection is reusable after it")
+
+    val duplicate=client.pipeline(["BEGIN","INSERT INTO abla_pipeline_marker VALUES(1)"],[[],[]])
+    check(!duplicate.succeeded && duplicate.sqlState=="23505" && client.transactionState==pgTransactionFailed,"P3 a failing statement leaves an aborted transaction with its SQLSTATE")
+    check(client.query("ROLLBACK").succeeded && client.transactionState==pgTransactionIdle,"P3 the usual rollback ends it")
+
+    check(client.query("SET default_transaction_read_only=on").succeeded,"P5 session made read-only")
+    val readOnly=client.pipeline(["BEGIN","INSERT INTO abla_pipeline_marker VALUES(3)"],[[],[]])
+    check(!readOnly.succeeded && readOnly.sqlState=="25006" && client.transactionState==pgTransactionLost && client.stream.connection.descriptor<0,"P5 a read-only refusal inside the pipeline discards the connection")
+    check(client.query("ROLLBACK").succeeded && marked(admin,3)=="0","P5 reset, and nothing was written")
+
+    check(client.query("BEGIN").succeeded,"P6 a transaction is open")
+    val nested=client.pipeline(["BEGIN","SELECT 1"],[[],[]])
+    check(!nested.succeeded && nested.sqlState=="25001" && client.transactionState==pgTransactionOpen,"P6 a pipeline BEGIN inside a transaction is refused before sending")
+    check(client.query("SELECT 2 AS two").first("two")=="2" && client.transactionState==pgTransactionOpen,"P6 the open transaction is untouched")
+    check(client.query("ROLLBACK").succeeded,"P6 rolled back")
+    check(!client.pipeline(["SELECT 1","BEGIN"],[[],[]]).succeeded,"a BEGIN that isn't first is refused")
+    check(!client.pipeline(["BEGIN","COMMIT"],[[],[]]).succeeded,"a pipeline cannot end its transaction")
+    check(!client.pipeline(["SELECT 1"],[]).succeeded,"one parameter list per statement")
+
+    val tagged=client.pipeline(["SELECT set_config('abla.request_id',$1,false)","SELECT current_setting('abla.request_id') AS id"],[[pgText("r-1")],[]])
+    check(tagged.succeeded && tagged.first("id")=="r-1" && tagged.columns.size==1 && client.transactionState==pgTransactionIdle,"a setting made earlier in the pipeline holds for the statement after it")
+
+    var state=PgSessionState()
+    val bridged=pgSessionPipeline(config,state,["BEGIN","SELECT 5 AS five"],[[],[]])
+    state=bridged.state
+    check(bridged.result.first("five")=="5" && state.transactionState==pgTransactionOpen,"the session bridge carries the pipelined transaction")
+    val ended=pgSessionQuery(config,state,"ROLLBACK")
+    check(ended.result.succeeded && ended.state.transactionState==pgTransactionIdle,"and ends it through the plain bridge")
+    pgSessionQuery(config,ended.state,"SELECT 1")
+    client.close()
+    admin.script("DROP TABLE abla_pipeline_marker")
+    admin.close()
+    return
+}
+
+fun main: int {
+    if (linuxArgument(0)=="pipeline-one-sync" || linuxArgument(0)=="pipeline-lost") return fakeServer()
+    fakeChecks()
+    if (linuxArgument(0)!="fake-only") realChecks()
+    println("$checks checks, $failures failed")
+    if (failures==0) 0 else 1
+}
