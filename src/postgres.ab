@@ -186,7 +186,10 @@ class PgClient(
     val config: PgConfig,
     var stream: PgStream,
     var authenticated: bool,
-    var transactionState: int = 0
+    var transactionState: int = 0,
+    // Of the last exchange: ParseComplete and CommandComplete messages seen.
+    var parsed: int = 0,
+    var completed: int = 0
 )
 
 val pgTransactionIdle = 0
@@ -748,15 +751,19 @@ fun pgExtendedQuery(sql: string, parameters: array<PgParameter>): string {
 
 // Parse, Bind, Describe and Execute of one unnamed statement, without the Sync
 // that ends a pipeline: several of these and one Sync are one round trip.
-fun pgExtendedStatement(sql: string, parameters: array<PgParameter>): string {
-    val parse: array<int> = []
-    parse.append(0)
-    pgAppendCString(parse, sql)
-    pgAppendU16(parse, 0)
+fun pgExtendedStatement(sql: string, parameters: array<PgParameter>): string = pgNamedStatement("", true, sql, parameters)
+
+// The same for a prepared statement `name` ("" is the unnamed one): with
+// `parse`, it is (re)defined from `sql` first; without, only bound and run.
+fun pgNamedStatement(name: string, parse: bool, sql: string, parameters: array<PgParameter>): string {
+    val defined: array<int> = []
+    pgAppendCString(defined, name)
+    pgAppendCString(defined, sql)
+    pgAppendU16(defined, 0)
 
     val bind: array<int> = []
     bind.append(0)
-    bind.append(0)
+    pgAppendCString(bind, name)
     pgAppendU16(bind, 0)
     pgAppendU16(bind, parameters.size)
     var index = 0
@@ -777,14 +784,188 @@ fun pgExtendedStatement(sql: string, parameters: array<PgParameter>): string {
 
     val describe: array<int> = [80, 0]
     val execute: array<int> = [0, 0, 0, 0, 0]
-    val parsed = pgTypedMessage(80, parse)
+    val parsed = if (parse) pgTypedMessage(80, defined) else ""
     val bound = pgTypedMessage(66, bind)
     val described = pgTypedMessage(68, describe)
     val executed = pgTypedMessage(69, execute)
     "$parsed$bound$described$executed"
 }
 
+// Close of prepared statement `name`: frees it on the server, answered by
+// CloseComplete; needs no Sync of its own.
+fun pgCloseStatement(name: string): string {
+    val body: array<int> = [83]
+    pgAppendCString(body, name)
+    pgTypedMessage(67, body)
+}
+
+// The statement cache (pgStatementCache(true)): per connection, a text used a
+// second time is prepared under a name and from then on only bound and run,
+// skipping PostgreSQL's parse, analysis and planning. Off by default.
+// - Per connection: entries are keyed by the connection's descriptor and
+//   dropped when the library disconnects it, so a later connection that gets
+//   the same descriptor starts empty.
+// - At most pgStatementCacheLimit names per connection; the least recently used
+//   is closed on the server with the next request.
+// - A text seen once is not prepared, so per-request SQL with values in its
+//   text cannot fill the cache.
+// - After a schema change PostgreSQL re-plans a prepared statement itself, but
+//   refuses one whose result columns change (a top-level * on a table that
+//   gained a column: 0A000), and a statement dropped by DISCARD is gone
+//   (26000). If nothing of the request has run yet and no transaction is open,
+//   the name is dropped and the statement prepared again and run once. Inside
+//   a transaction the statement fails with that SQLSTATE (pgStatementStale
+//   tells it apart); the transaction is aborted, as for any error, and the
+//   caller decides whether the whole transaction may run again.
+// - DISCARD, DEALLOCATE, RESET, SET ROLE, SET SESSION AUTHORIZATION, SET
+//   search_path and any simple-protocol script empty the connection's cache;
+//   its names are closed with the next request. Names are never reused on a
+//   connection, so a Close that arrives late can't hit a newer statement.
+var pgStatementCacheOn = false
+val pgStatementCacheLimit = 256
+val pgStatementSeenLimit = 4096
+// "connection|text" → name, last use; "connection|text" seen once; connection → names held, next name number, use clock.
+val pgCachedNames: Map<string, string> = Map()
+val pgCachedUses: Map<string, int> = Map()
+val pgSeenOnce: Map<string, bool> = Map()
+val pgCachedCounts: Map<int, int> = Map()
+val pgCachedNext: Map<int, int> = Map()
+val pgCachedClock: Map<int, int> = Map()
+// Names evicted from a connection, closed on the server with its next request.
+val pgCachedClosing: Map<int, string> = Map()
+
+fun pgStatementCache(enabled: bool): void {
+    pgStatementCacheOn = enabled
+    return
+}
+
+fun pgCountOf(map: Map<int, int>, key: int): int {
+    val value = map.get(key)
+    if (value == null) 0 else value
+}
+
+fun pgStatementStale(result: PgResult): bool = result.sqlState == "0A000" || result.sqlState == "26000"
+
+fun pgCacheKey(stream: PgStream): int = if (stream.tls != 0) pgSessionTls + stream.tls else stream.connection.descriptor
+
+// How many statements connection `key` holds prepared (for tests and diagnostics).
+fun pgStatementCacheSize(key: int): int {
+    pgCountOf(pgCachedCounts, key)
+}
+
+fun pgStatementCacheForget(key: int): void {
+    val prefix = "$key|"
+    for (entry in pgCachedNames.keys()) if (entry.startsWith(prefix)) { pgCachedNames.remove(entry); pgCachedUses.remove(entry) }
+    for (entry in pgSeenOnce.keys()) if (entry.startsWith(prefix)) pgSeenOnce.remove(entry)
+    pgCachedCounts.remove(key)
+    pgCachedNext.remove(key)
+    pgCachedClock.remove(key)
+    pgCachedClosing.remove(key)
+    return
+}
+
+// Statements after which the connection's prepared statements are gone or may resolve differently.
+fun pgStatementCacheResets(sql: string): bool {
+    val words = sql.trim().uppercase().replace("\n", " ").replace("\t", " ").split(" ")
+    if (words.size == 0) return false
+    val first = words[0]
+    if (first == "DISCARD" || first == "DEALLOCATE" || first == "RESET") return true
+    if (first == "SET" && words.size > 1) {
+        var index = 1
+        while (index < words.size && (words[index] == "" || words[index] == "SESSION" || words[index] == "LOCAL")) index = index + 1
+        if (index < words.size) {
+            val what = words[index]
+            if (what == "ROLE" || what == "AUTHORIZATION" || what.startsWith("SEARCH_PATH")) return true
+        }
+    }
+    false
+}
+
+class PgCachedPlan(val bytes: string, val name: string, val parse: bool, val cached: bool)
+
+// How connection `key` sends `sql`: bound to its prepared name, prepared now
+// under a new name (its second use), or unnamed as without the cache.
+fun pgCachePlan(key: int, sql: string, parameters: array<PgParameter>): PgCachedPlan {
+    val entry = "$key|$sql"
+    val clock = pgCountOf(pgCachedClock, key) + 1
+    pgCachedClock.set(key, clock)
+    val known = pgCachedNames.get(entry)
+    if (known != null) {
+        pgCachedUses.set(entry, clock)
+        return PgCachedPlan(pgNamedStatement(known, false, sql, parameters), known, false, true)
+    }
+    if (!pgSeenOnce.has(entry)) {
+        if (pgSeenOnce.size >= pgStatementSeenLimit) pgSeenOnce.clear()
+        pgSeenOnce.set(entry, true)
+        return PgCachedPlan(pgExtendedStatement(sql, parameters), "", true, false)
+    }
+    val number = pgCountOf(pgCachedNext, key) + 1
+    pgCachedNext.set(key, number)
+    val name = "abla_s$number"
+    PgCachedPlan(pgNamedStatement(name, true, sql, parameters), name, true, false)
+}
+
+// Records `name` for `sql` once PostgreSQL confirmed its Parse, evicting the
+// least recently used name when the connection is full.
+fun pgCacheRecord(key: int, sql: string, name: string): void {
+    val entry = "$key|$sql"
+    pgSeenOnce.remove(entry)
+    // The same text prepared twice in one request: keep the first name.
+    if (pgCachedNames.has(entry)) {
+        val closing = pgCachedClosing.get(key)
+        pgCachedClosing.set(key, "${if (closing == null) "" else closing}${pgCloseStatement(name)}")
+        return
+    }
+    val count = pgStatementCacheSize(key)
+    if (count >= pgStatementCacheLimit) {
+        val prefix = "$key|"
+        var oldest = ""
+        var oldestUse = 0
+        for (other in pgCachedUses.keys()) if (other.startsWith(prefix)) {
+            val use = pgCachedUses.get(other)
+            if (use != null && (oldest == "" || use < oldestUse)) { oldest = other; oldestUse = use }
+        }
+        if (oldest != "") {
+            val sqlOf = oldest.slice(prefix.size, oldest.size)
+            pgCacheDrop(key, sqlOf)
+        }
+    }
+    pgCachedNames.set(entry, name)
+    pgCachedUses.set(entry, pgCountOf(pgCachedClock, key))
+    pgCachedCounts.set(key, pgStatementCacheSize(key) + 1)
+    return
+}
+
+// Drops a name PostgreSQL refused, closing it with the next request.
+fun pgCacheDrop(key: int, sql: string): void {
+    val entry = "$key|$sql"
+    val name = pgCachedNames.get(entry)
+    if (name == null) return
+    val closing = pgCachedClosing.get(key)
+    pgCachedClosing.set(key, "${if (closing == null) "" else closing}${pgCloseStatement(name)}")
+    pgCachedNames.remove(entry)
+    pgCachedUses.remove(entry)
+    pgCachedCounts.set(key, pgStatementCacheSize(key) - 1)
+    return
+}
+
+// Every name of the connection closed with its next request, and nothing known
+// prepared; the name counter goes on.
+fun pgStatementCacheDrain(key: int): void {
+    val prefix = "$key|"
+    for (entry in pgCachedNames.keys()) if (entry.startsWith(prefix)) pgCacheDrop(key, entry.slice(prefix.size, entry.size))
+    for (entry in pgSeenOnce.keys()) if (entry.startsWith(prefix)) pgSeenOnce.remove(entry)
+    return
+}
+
+fun pgCacheTakeClosing(key: int): string {
+    val closing = pgCachedClosing.get(key)
+    pgCachedClosing.remove(key)
+    if (closing == null) "" else closing
+}
+
 fun PgClient.disconnect(): void {
+    if (this.stream.connection.descriptor >= 0 || this.stream.tls != 0) pgStatementCacheForget(pgCacheKey(this.stream))
     if (this.transactionState == pgTransactionOpen || this.transactionState == pgTransactionFailed) this.transactionState = pgTransactionLost
     if (this.stream.tls != 0) pgTlsAdded[0].close(this.stream.tls)
     this.stream.tls = 0
@@ -844,7 +1025,61 @@ fun PgClient.query(
 ): PgResult {
     val replyTimeout = if (timeoutMilliseconds > 0) timeoutMilliseconds
         else this.config.readTimeoutMilliseconds
-    this.exchange(pgExtendedQuery(sql, parameters), replyTimeout, pgTransactionControl(sql))
+    val control = pgTransactionControl(sql)
+    val result = if (pgStatementCacheOn && control == 0) this.cachedExchange([sql], [parameters], replyTimeout, 0)
+        else this.exchange(pgExtendedQuery(sql, parameters), replyTimeout, control)
+    if (pgStatementCacheResets(sql) && this.authenticated) pgStatementCacheDrain(pgCacheKey(this.stream))
+    result
+}
+
+// A request through the statement cache: queued Closes, then each statement
+// bound to its name, prepared under a new one, or unnamed; one Sync.
+private fun PgClient.cachedExchange(statements: array<string>, parameters: array<array<PgParameter>>, replyTimeout: int, control: int): PgResult {
+    val before = this.transactionState
+    val empty: array<int> = []
+    if (before == pgTransactionIdle && !this.authenticated) {
+        val error = this.connect()
+        if (error != "") return PgResult(false,[],[],"",error,"08001")
+    }
+    // In an aborted, lost or unknown transaction nothing is prepared or bound by name: it fails as without the cache.
+    if (before != pgTransactionIdle && before != pgTransactionOpen) {
+        var plain = ""
+        for (index in 0 until statements.size) plain = "$plain${pgExtendedStatement(statements[index], parameters[index])}"
+        return this.exchange("$plain${pgTypedMessage(83, empty)}", replyTimeout, control, 0, statements.size)
+    }
+    val key = pgCacheKey(this.stream)
+    var request = pgCacheTakeClosing(key)
+    val plans: array<PgCachedPlan> = []
+    var anyCached = false
+    for (index in 0 until statements.size) {
+        val plan = if (pgTransactionControl(statements[index]) != 0) PgCachedPlan(pgExtendedStatement(statements[index], parameters[index]), "", true, false)
+            else pgCachePlan(key, statements[index], parameters[index])
+        if (plan.cached) anyCached = true
+        plans.append(plan)
+        request = "$request${plan.bytes}"
+    }
+    val result = this.exchange("$request${pgTypedMessage(83, empty)}", replyTimeout, control, 0, statements.size)
+    val alive = this.authenticated && pgCacheKey(this.stream) == key
+    if (alive) {
+        // The k-th Parse sent was confirmed when k ParseCompletes came back.
+        var parses = 0
+        for (index in 0 until plans.size) if (plans[index].parse) {
+            if (parses < this.parsed && plans[index].name != "") pgCacheRecord(key, statements[index], plans[index].name)
+            parses = parses + 1
+        }
+    }
+    if (result.succeeded || !anyCached || !pgStatementStale(result)) return result
+    // A name PostgreSQL refused: forget every name this request bound.
+    if (alive) for (index in 0 until plans.size) if (plans[index].cached) pgCacheDrop(key, statements[index])
+    if (!alive || before != pgTransactionIdle) return result
+    // Nothing of it stands: autocommit with nothing completed, or a transaction
+    // this request opened itself, rolled back. Then once more, unnamed.
+    if (control == 1) {
+        if (this.transactionState != pgTransactionFailed || !this.exchange(pgExtendedQuery("ROLLBACK", []), replyTimeout, 3).succeeded) return result
+    } else if (this.completed != 0 || this.transactionState != pgTransactionIdle) return result
+    var plain = pgCacheTakeClosing(key)
+    for (index in 0 until statements.size) plain = "$plain${pgExtendedStatement(statements[index], parameters[index])}"
+    this.exchange("$plain${pgTypedMessage(83, empty)}", replyTimeout, control, 0, statements.size)
 }
 
 // Statements sent together and answered in one round trip: the extended
@@ -872,6 +1107,14 @@ fun PgClient.pipeline(
         index = index + 1
     }
     if (control == 1 && this.transactionState != pgTransactionIdle) return PgResult(false,[],[],"","A transaction is already open; a pipeline cannot begin another","25001")
+    val replyTimeout = if (timeoutMilliseconds > 0) timeoutMilliseconds else this.config.readTimeoutMilliseconds
+    if (pgStatementCacheOn) {
+        val result = this.cachedExchange(statements, parameters, replyTimeout, control)
+        var resets = false
+        for (statement in statements) if (pgStatementCacheResets(statement)) resets = true
+        if (resets && this.authenticated) pgStatementCacheDrain(pgCacheKey(this.stream))
+        return result
+    }
     val empty: array<int> = []
     this.exchange(
         "$request${pgTypedMessage(83, empty)}",
@@ -893,12 +1136,15 @@ fun PgClient.script(
 ): PgResult {
     val body: array<int> = []
     pgAppendCString(body, sql)
-    this.exchange(
+    val result = this.exchange(
         pgTypedMessage(81, body),
         if (timeoutMilliseconds > 0) timeoutMilliseconds
         else this.config.readTimeoutMilliseconds,
         4
     )
+    // A script may DISCARD, DEALLOCATE or change the search path: start over.
+    if (pgStatementCacheOn && this.authenticated) pgStatementCacheDrain(pgCacheKey(this.stream))
+    result
 }
 
 private fun PgClient.exchange(request: string, replyTimeout: int, control: int, deadline: int = 0, statements: int = 1): PgResult {
@@ -924,6 +1170,8 @@ private fun PgClient.exchange(request: string, replyTimeout: int, control: int, 
     var sent = false
     // Statements of a pipeline that completed: only the last one's rows are kept.
     var completed = 0
+    this.parsed = 0
+    this.completed = 0
     if (error == "") {
         // Record a possible BEGIN before sending it: losing its ReadyForQuery
         // must not make the next statement an autocommitted write. A script may
@@ -962,7 +1210,10 @@ private fun PgClient.exchange(request: string, replyTimeout: int, control: int, 
             error == "") {
             command = message.body.slice(0, message.body.size - 1)
             completed = completed + 1
+            this.completed = completed
             if (completed < statements) { columns.clear(); rows.clear() }
+        } else if (message.kind == 49) {
+            this.parsed = this.parsed + 1
         } else if (message.kind == 90) {
             if (message.body.size != 1 || (message.body[0] != 73 && message.body[0] != 84 && message.body[0] != 69)) {
                 error = "PostgreSQL sent an invalid transaction state"

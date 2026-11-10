@@ -189,6 +189,8 @@ fun realChecks(): void {
 }
 
 fun main: int {
+    // tools/test-postgres.sh runs this once more with the statement cache on: the same transaction rules hold.
+    if (pgEnvironment("PG_TEST_STATEMENT_CACHE", "") == "1") pgStatementCache(true)
     if (linuxArgument(0)=="pipeline-one-sync" || linuxArgument(0)=="pipeline-lost") return fakeServer()
     fakeChecks()
     if (linuxArgument(0)!="fake-only") realChecks()

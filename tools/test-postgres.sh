@@ -24,6 +24,8 @@ mkdir -p "$project_dir/build"
     -o "$project_dir/build/transaction-test" --fast --no-cache
 "$compiler" build "$project_dir/tests/pipeline_test.ab" \
     -o "$project_dir/build/pipeline-test" --fast --no-cache
+"$compiler" build "$project_dir/tests/cache_test.ab" \
+    -o "$project_dir/build/cache-test" --fast --no-cache
 "$compiler" build "$project_dir/tests/async_test.ab" \
     -o "$project_dir/build/async-test" --fast --no-cache
 "$compiler" build "$project_dir/tests/hosts_test.ab" \
@@ -77,6 +79,17 @@ run_mode() {
     POSTGRES_HOST=127.0.0.1 POSTGRES_PORT="$port" POSTGRES_DB=abla_test \
     POSTGRES_USER=postgres POSTGRES_PASSWORD="$password" \
         "$project_dir/build/pipeline-test"
+
+    # The same transaction rules with the statement cache on, and the cache's own checks.
+    POSTGRES_HOST=127.0.0.1 POSTGRES_PORT="$port" POSTGRES_DB=abla_test \
+    POSTGRES_USER=postgres POSTGRES_PASSWORD="$password" PG_TEST_STATEMENT_CACHE=1 \
+        "$project_dir/build/transaction-test"
+    POSTGRES_HOST=127.0.0.1 POSTGRES_PORT="$port" POSTGRES_DB=abla_test \
+    POSTGRES_USER=postgres POSTGRES_PASSWORD="$password" PG_TEST_STATEMENT_CACHE=1 \
+        "$project_dir/build/pipeline-test"
+    POSTGRES_HOST=127.0.0.1 POSTGRES_PORT="$port" POSTGRES_DB=abla_test \
+    POSTGRES_USER=postgres POSTGRES_PASSWORD="$password" \
+        "$project_dir/build/cache-test"
 
     if [ "$mode" != trust ]; then
         # The existing pool regression uses42 as its successful process result.

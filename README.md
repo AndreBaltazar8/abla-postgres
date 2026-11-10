@@ -194,6 +194,36 @@ lost BEGIN, never autocommitted. Settings made by an earlier statement
 val opened = client.pipeline(["BEGIN", "SELECT id FROM organizations WHERE id=\$1::uuid FOR SHARE"], [[], [pgText(org)]])
 ```
 
+### Statement cache
+
+`pgStatementCache(true)` (off by default) keeps, per connection, a prepared
+statement for each SQL text used a second time; later calls only bind and run
+it, skipping PostgreSQL's parse, analysis and planning (on a session check:
+459 → 171 µs on localhost). A text seen once is never prepared, so SQL with
+values written into its text can't fill it; at most 256 names per connection,
+the least recently used closed on the server with the next request. DISCARD,
+DEALLOCATE, RESET, SET ROLE/SESSION AUTHORIZATION/search_path and any
+`script` empty it; a lost connection takes its cache with it.
+
+After a schema change PostgreSQL re-plans prepared statements itself. Only a
+statement whose own result columns come from `*` changes shape, and PostgreSQL
+refuses to run it (SQLSTATE 0A000, "cached plan must not change result type"):
+
+```sql
+SELECT * FROM items                       -- refused after ALTER TABLE items ADD COLUMN
+UPDATE items SET n=n RETURNING *          -- refused
+SELECT json_agg(r)::text FROM (SELECT * FROM items) r              -- adapts: the new key appears
+WITH u AS (UPDATE items SET n=n RETURNING *) SELECT row_to_json(u)::text FROM u   -- adapts
+SELECT id, n FROM items                   -- unaffected; a renamed column is an error, never the old name
+```
+
+A refused or vanished (26000) statement is prepared again and run once when
+nothing of the request has run and no transaction was open, or the
+transaction was the request's own pipeline (rolled back first). Inside a
+caller's transaction it fails with that SQLSTATE (`pgStatementStale(result)`),
+the transaction aborted like after any error; never misaligned columns. Name
+the columns instead of `*` where an old binary may meet a new schema.
+
 Use `pgNull()` for a SQL null value:
 
 ```abla

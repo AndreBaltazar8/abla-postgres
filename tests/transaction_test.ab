@@ -191,6 +191,8 @@ fun coalescedNotificationChecks(): void {
 }
 
 fun main: int {
+    // tools/test-postgres.sh runs this once more with the statement cache on: the same transaction rules hold.
+    if (pgEnvironment("PG_TEST_STATEMENT_CACHE", "") == "1") pgStatementCache(true)
     if (linuxArgument(0)=="lost-begin" || linuxArgument(0)=="lost-commit" || linuxArgument(0)=="coalesced-notify") return lostBeginServer()
     if(linuxArgument(0)=="notify-proof") { coalescedNotificationChecks(); println("$checks checks, $failures failed"); return if(failures==0) 0 else 1 }
     lostBeginChecks()

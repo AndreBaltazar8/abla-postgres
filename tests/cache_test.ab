@@ -1,0 +1,145 @@
+import "../src/postgres.ab"
+import "abla/io"
+
+// The statement cache against a real PostgreSQL (tools/test-postgres.sh): a text used twice is prepared and then
+// only bound; schema changes under a warm cache run correctly or fail cleanly, never with misaligned columns.
+var failures = 0
+var checks = 0
+fun check(ok: bool, name: string): void {
+    checks = checks + 1
+    println("${if (ok) "ok" else "FAIL"} $name")
+    if (!ok) failures = failures + 1
+    return
+}
+fun names(result: PgResult): string {
+    var out = ""
+    for (column in result.columns) out = if (out == "") column else "$out,$column"
+    out
+}
+// Executions PostgreSQL counts for the prepared statement of exactly this text on this session.
+fun executions(var client: PgClient, sql: string): int = pgInt(client.query("SELECT COALESCE(sum(generic_plans+custom_plans),0)::text AS n FROM pg_prepared_statements WHERE statement=$1",[pgText(sql)]).first("n"))
+fun prepared(var client: PgClient): int = pgInt(client.query("SELECT count(*)::text AS n FROM pg_prepared_statements").first("n"))
+fun warm(var client: PgClient, sql: string, parameters: array<PgParameter> = []): bool = client.query(sql, parameters).succeeded && client.query(sql, parameters).succeeded
+
+fun main: int {
+    val config = pgConfigFromEnvironment()
+    var admin = pgClient(config)
+    check(admin.script("DROP TABLE IF EXISTS abla_cache_t; CREATE TABLE abla_cache_t(id int PRIMARY KEY, a text); INSERT INTO abla_cache_t VALUES (1,'x')").succeeded, "private table")
+
+    pgStatementCache(false)
+    var off = pgClient(config)
+    for (i in 0 until 3) off.query("SELECT id, a FROM abla_cache_t")
+    check(prepared(off) == 0, "C6 switched off: nothing is prepared, every call parses as before")
+    off.close()
+
+    pgStatementCache(true)
+    var client = pgClient(config)
+    val plain = "SELECT id, a FROM abla_cache_t WHERE id=$1::int"
+    val first = client.query(plain, [pgText("1")])
+    check(first.succeeded && first.first("a") == "x" && pgStatementCacheSize(pgCacheKey(client.stream)) == 0, "C5 a text seen once is not prepared")
+    val second = client.query(plain, [pgText("1")])
+    check(second.succeeded && second.first("a") == "x" && pgStatementCacheSize(pgCacheKey(client.stream)) == 1, "C1 its second use prepares it")
+    for (i in 0 until 3) client.query(plain, [pgText("1")])
+    check(executions(client, plain) == 4, "C1 later uses run the prepared statement by name (4 executions counted)")
+    val bound = client.query(plain, [pgText("2")])
+    check(bound.succeeded && bound.rows.size == 0, "C1 parameters still bind per call")
+
+    for (i in 0 until 300) client.query("SELECT $i AS once")
+    check(pgStatementCacheSize(pgCacheKey(client.stream)) == 1, "C5 300 one-off texts leave the cache as it was")
+
+    // Shapes warmed before the schema changes.
+    val star = "SELECT * FROM abla_cache_t"
+    val starInTx = "SELECT * FROM abla_cache_t WHERE true"
+    val wrapped = "SELECT COALESCE(json_agg(r),'[]')::text AS data FROM (SELECT * FROM abla_cache_t) r"
+    val returning = "UPDATE abla_cache_t SET a=a RETURNING *"
+    val returningCte = "WITH u AS (UPDATE abla_cache_t SET a=a RETURNING *) SELECT row_to_json(u)::text AS data FROM u"
+    val explicit = "SELECT id, a FROM abla_cache_t"
+    check(warm(client, star) && warm(client, starInTx) && warm(client, wrapped) && warm(client, returning) && warm(client, returningCte) && warm(client, explicit), "warm cache of six shapes")
+    check(admin.query("ALTER TABLE abla_cache_t ADD COLUMN b int DEFAULT 7").succeeded, "another session adds a column")
+    val starAfter = client.query(star)
+    check(starAfter.succeeded && names(starAfter) == "id,a,b", "C2 top-level * outside a transaction: prepared again and run once, the new columns (${names(starAfter)})")
+    check(client.query("BEGIN").succeeded, "C2 a transaction")
+    val starTx = client.query(starInTx)
+    check(!starTx.succeeded && pgStatementStale(starTx) && starTx.sqlState == "0A000" && starTx.rows.size == 0 && client.transactionState == pgTransactionFailed, "C2 top-level * inside a transaction fails as 0A000, no rows, transaction aborted")
+    check(client.query("ROLLBACK").succeeded, "C2 rolled back")
+    val starTxAgain = client.query(starInTx)
+    check(starTxAgain.succeeded && names(starTxAgain) == "id,a,b", "C2 after the failure the statement is prepared afresh")
+    val wrappedAfter = client.query(wrapped)
+    check(wrappedAfter.succeeded && wrappedAfter.first("data").contains("\"b\":7"), "C2 json over * adapts and includes the new column")
+    check(client.query("BEGIN").succeeded, "C2 a transaction for RETURNING *")
+    val returningTx = client.query(returning)
+    check(!returningTx.succeeded && returningTx.sqlState == "0A000", "C2 top-level RETURNING * inside a transaction fails as 0A000")
+    client.query("ROLLBACK")
+    val cteAfter = client.query(returningCte)
+    check(cteAfter.succeeded && cteAfter.first("data").contains("\"b\":7"), "C2 RETURNING * inside a CTE adapts")
+    val explicitAfter = client.query(explicit)
+    check(explicitAfter.succeeded && names(explicitAfter) == "id,a", "C2 explicit columns are unaffected")
+
+    // C3: the table dropped and made again; and the server losing the statements without the client knowing (26000).
+    check(warm(client, explicit), "C3 explicit columns warm")
+    check(admin.script("DROP TABLE abla_cache_t; CREATE TABLE abla_cache_t(id int PRIMARY KEY, a text, b int); INSERT INTO abla_cache_t VALUES (2,'y',8)").succeeded, "C3 table dropped and recreated")
+    val recreated = client.query(explicit)
+    check(recreated.succeeded && recreated.first("a") == "y" && names(recreated) == "id,a", "C3 a cached statement reads the new table")
+    check(warm(client, explicit) && client.query("DO \$\$BEGIN EXECUTE 'DEALLOCATE ALL'; END\$\$").succeeded, "C3 the server drops every prepared statement behind the client's back")
+    val gone = client.query(explicit)
+    check(gone.succeeded && gone.first("a") == "y", "C3 26000 outside a transaction: prepared again and run once")
+    // plain was prepared before that DEALLOCATE too: outside a transaction it is prepared again.
+    check(client.query(plain, [pgText("2")]).succeeded, "C3 another stale name, repaired outside a transaction")
+    val begun = client.query("BEGIN")
+    val w1 = client.query(plain, [pgText("2")])
+    val w2 = client.query(plain, [pgText("2")])
+    check(begun.succeeded && w1.succeeded && w2.succeeded, "C3 warm inside a transaction (${begun.error}|${w1.error}|${w2.error})")
+    client.query("COMMIT")
+    client.query("DO \$\$BEGIN EXECUTE 'DEALLOCATE ALL'; END\$\$")
+    check(client.query("BEGIN").succeeded, "C3 a transaction")
+    val goneTx = client.query(plain, [pgText("2")])
+    check(!goneTx.succeeded && goneTx.sqlState == "26000" && pgStatementStale(goneTx), "C3 26000 inside a transaction fails cleanly")
+    client.query("ROLLBACK")
+
+    // C7: a column renamed by another session: an error, not the old name.
+    val renamedSql = "SELECT a FROM abla_cache_t"
+    check(warm(client, renamedSql), "C7 explicit column warm")
+    check(admin.query("ALTER TABLE abla_cache_t RENAME COLUMN a TO c").succeeded, "C7 another session renames it")
+    val renamed = client.query(renamedSql)
+    check(!renamed.succeeded && renamed.sqlState == "42703" && renamed.columns.size == 0, "C7 the warm statement fails (42703), it never returns the old name")
+    admin.query("ALTER TABLE abla_cache_t RENAME COLUMN c TO a")
+
+    // C8: a changed search path or role empties the cache; its names are closed on the server.
+    check(warm(client, explicit) && pgStatementCacheSize(pgCacheKey(client.stream)) > 0, "C8 cache holds statements")
+    check(client.query("SET search_path TO public").succeeded && pgStatementCacheSize(pgCacheKey(client.stream)) == 0, "C8 SET search_path empties it")
+    check(client.query("SELECT 1 AS one").succeeded && prepared(client) == 0, "C8 and the next request closes them on the server")
+    check(warm(client, explicit) && client.query("RESET ALL").succeeded && pgStatementCacheSize(pgCacheKey(client.stream)) == 0, "C8 RESET empties it")
+    check(warm(client, explicit) && client.script("SELECT 1").succeeded && pgStatementCacheSize(pgCacheKey(client.stream)) == 0, "C8 a script empties it")
+
+    // LRU: more texts than the limit, each used twice.
+    for (i in 0 until pgStatementCacheLimit + 10) { client.query("SELECT $i AS lru"); client.query("SELECT $i AS lru") }
+    check(pgStatementCacheSize(pgCacheKey(client.stream)) == pgStatementCacheLimit, "LRU the connection holds at most $pgStatementCacheLimit")
+    check(prepared(client) <= pgStatementCacheLimit, "LRU evicted names are closed on the server (the count includes its own probe statement)")
+
+    // Pipeline: BEGIN with a cached statement; a stale one inside a pipeline that opened the transaction is redone.
+    val lock = "SELECT id FROM abla_cache_t WHERE id=$1::int FOR SHARE"
+    check(warm(client, lock, [pgText("2")]), "pipeline statement warm")
+    val piped = client.pipeline(["BEGIN", lock], [[], [pgText("2")]])
+    check(piped.succeeded && piped.rows.size == 1 && client.transactionState == pgTransactionOpen && executions(client, lock) >= 2, "pipeline binds the cached statement after BEGIN")
+    client.query("ROLLBACK")
+    val starLock = "SELECT * FROM abla_cache_t WHERE id=$1::int FOR SHARE"
+    check(warm(client, starLock, [pgText("2")]) && admin.query("ALTER TABLE abla_cache_t ADD COLUMN d int").succeeded, "pipeline: a * statement warm, then a column added")
+    val redone = client.pipeline(["BEGIN", starLock], [[], [pgText("2")]])
+    check(redone.succeeded && names(redone) == "id,a,b,d" && client.transactionState == pgTransactionOpen, "a stale statement in a pipeline that opened its own transaction is rolled back and run once more")
+    client.query("ROLLBACK")
+
+    // C4: a lost connection takes its cache with it.
+    check(warm(client, explicit), "C4 warm before the connection is lost")
+    val pid = client.query("SELECT pg_backend_pid()::text AS pid").first("pid")
+    val oldKey = pgCacheKey(client.stream)
+    admin.query("SELECT pg_terminate_backend($1::int)", [pgText(pid)])
+    client.query("SELECT 1")
+    check(pgStatementCacheSize(oldKey) == 0 || pgCacheKey(client.stream) == oldKey, "C4 the lost connection's names are gone")
+    val fresh = client.query(explicit)
+    check(fresh.succeeded && pgStatementCacheSize(pgCacheKey(client.stream)) == 0 && prepared(client) == 0, "C4 the new connection starts empty, even on a reused descriptor")
+    client.close()
+    admin.script("DROP TABLE abla_cache_t")
+    admin.close()
+    println("$checks checks, $failures failed")
+    if (failures == 0) 0 else 1
+}
