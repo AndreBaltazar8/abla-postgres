@@ -40,7 +40,7 @@ The current release includes:
   authentication;
 - RFC-compatible SHA-256/HMAC/PBKDF2 proofs from `abla/crypto`, with server-signature
   verification;
-- TLS, by its own import so that only programs using it link OpenSSL; 
+- TLS, by its own import (abla/tls/pure: no OpenSSL, no libc); 
 - environment-based configuration; and
 - numeric IPv4 plus Docker/Icy service-name resolution.
 
@@ -71,7 +71,7 @@ a `PgConfig`'s `sslMode` and `sslRootCert`, or `POSTGRES_SSLMODE` and `POSTGRES_
 - `verify-full`: that, and it names `host`, as a name or as an address.
 
 There's no fallback: a server without TLS, a certificate that doesn't check out, or a program that asks without
-having added it gets an error, not a plain connection. Without the import a program links no OpenSSL. The async pool uses the same TLS policy through nonblocking SSLRequest, handshake, authentication and query states. `detachConnection(slot)` transfers both the fd and its TLS handle for a dedicated LISTEN connection; copying only an fd is insufficient. A pool can receive `resolvedCandidates` from an off-loop resolver while retaining the original host names for certificate checks.
+having added it gets an error, not a plain connection. Nothing here links OpenSSL. The async pool uses the same TLS policy through nonblocking SSLRequest, handshake, authentication and query states. `detachConnection(slot)` transfers both the fd and its TLS handle for a dedicated LISTEN connection; copying only an fd is insufficient. A pool can receive `resolvedCandidates` from an off-loop resolver while retaining the original host names for certificate checks.
 
 ## Querying
 
