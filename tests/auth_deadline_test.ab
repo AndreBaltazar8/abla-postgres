@@ -2,6 +2,12 @@ import "../src/postgres.ab"
 import "abla/io"
 import "abla/fs"
 import "abla/process/time"
+import "abla/sys/linux/net"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/text"
 
 fun server(): int {
     val parent=pgInt(linuxArgument(1))

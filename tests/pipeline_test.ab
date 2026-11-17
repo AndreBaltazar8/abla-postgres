@@ -3,6 +3,9 @@ import "abla/io"
 import "abla/fs"
 import "abla/sys/linux"
 import "abla/process/time"
+import "abla/sys/linux/process"
+import "abla/text"
+import "abla/sys/linux/net"
 
 // PgClient.pipeline: statements answered in one round trip. A fake server proves the round trip and a lost
 // reply; a real PostgreSQL (tools/test-postgres.sh) proves what runs and the transaction state afterwards.

@@ -3,6 +3,11 @@ import "../src/async.ab"
 import "abla/io"
 import "abla/fs"
 import "abla/process/time"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/text"
+import "../src/crypto.ab"
+import "abla/sys/linux/net"
 
 var checks = 0
 var failures = 0

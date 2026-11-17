@@ -7,6 +7,8 @@
 import "postgres.ab"
 import "abla/tls/pure"
 import "abla/sys/linux/net"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
 
 // A session and what the blocking calls (send, receive) bound themselves by. The handle of a session is its descriptor plus
 // one, so that 0 can say "no TLS", and the table is the only owner of the descriptor until close.

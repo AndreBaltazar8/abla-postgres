@@ -1,5 +1,6 @@
 import "../src/postgres.ab"
 import "abla/io"
+import "abla/text"
 
 // The statement cache against a real PostgreSQL (tools/test-postgres.sh): a text used twice is prepared and then
 // only bound; schema changes under a warm cache run correctly or fail cleanly, never with misaligned columns.

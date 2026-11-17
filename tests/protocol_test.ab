@@ -2,6 +2,7 @@ import "abla/text"
 import "../src/postgres.ab"
 import "abla/io"
 import "abla/process/time"
+import "abla/sys/linux/net"
 
 fun withReadTimeout(config: PgConfig, milliseconds: int): PgConfig = PgConfig(
     config.host, config.port, config.database, config.user, config.password,

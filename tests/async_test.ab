@@ -1,5 +1,7 @@
 import "../src/async.ab"
 import "abla/io"
+import "../src/postgres.ab"
+import "abla/text"
 
 // Requires a PostgreSQL server; configure with POSTGRES_HOST/PORT/DB/USER/
 // PASSWORD (tools/test-postgres.sh provides one).

@@ -4,6 +4,9 @@ import "abla/io"
 import "abla/fs"
 import "abla/sys/linux"
 import "abla/process/time"
+import "abla/sys/linux/process"
+import "abla/text"
+import "abla/sys/linux/net"
 
 var failures = 0
 var checks = 0

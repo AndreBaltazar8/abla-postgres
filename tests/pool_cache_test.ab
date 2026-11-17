@@ -2,6 +2,11 @@ import "../src/async.ab"
 import "abla/io"
 import "abla/fs"
 import "abla/process/time"
+import "../src/postgres.ab"
+import "abla/sys/linux/process"
+import "abla/sys/linux"
+import "abla/sys/linux/net"
+import "abla/text"
 
 fun startup(var stream: PgStream): bool {
     var bytes=""
