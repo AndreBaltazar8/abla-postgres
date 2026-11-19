@@ -9,6 +9,8 @@ check:
 	build/host-address-test
 	$(COMPILER) build tests/crypto_test.ab -o build/crypto-test --fast --no-cache
 	build/crypto-test
+	$(COMPILER) build tests/channel_binding_test.ab -o build/channel-binding-test --fast --no-cache
+	build/channel-binding-test
 	$(COMPILER) build tests/protocol_test.ab -o build/protocol-test --fast --no-cache
 	$(COMPILER) build tests/transaction_test.ab -o build/transaction-test --fast --no-cache
 	$(COMPILER) build tests/pipeline_test.ab -o build/pipeline-test --fast --no-cache

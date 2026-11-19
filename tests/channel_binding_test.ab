@@ -1,0 +1,76 @@
+// The choice of SCRAM mechanism and GS2 header under libpq's channel_binding (prefer, require, disable), against a fake TLS
+// that gives a fixed tls-server-end-point binding (or none): no server needed. The wire behaviour against real PostgreSQL
+// and a stripping relay is tools/test-postgres.sh (run_binding).
+import "../src/postgres.ab"
+import "abla/io"
+import "abla/sys/linux/net"
+import "abla/text"
+
+class FakeTls(var binding: string) : PgTls {
+    fun upgrade(var connection: TcpConnection, host: string, mode: string, rootCert: string, timeoutMilliseconds: int): int = 0
+    fun failure(): string = ""
+    fun send(handle: int, bytes: string): int = -1
+    fun receive(handle: int, timeoutMilliseconds: int): string = ""
+    fun close(handle: int): void { return }
+    fun start(descriptor: int, host: string, mode: string, rootCert: string): int = 0
+    fun handshake(handle: int): int = -1
+    fun sendReady(handle: int, bytes: string, offset: int): PgTlsIo = PgTlsIo("", 0, -1)
+    fun receiveReady(handle: int, maximum: int): PgTlsIo = PgTlsIo("", 0, -1)
+    fun sendUntil(handle: int, bytes: string, deadline: int): int = -1
+    fun channelBinding(handle: int, kind: string): string = if (kind == "tls-server-end-point") this.binding else ""
+}
+
+var failures = 0
+
+fun expect(name: string, choice: PgSaslChoice, mechanism: string, header: string, binding: string, error: string): void {
+    if (choice.mechanism != mechanism || choice.header != header || choice.binding != binding || choice.error != error) {
+        println("FAIL $name: got [${choice.mechanism}] [${choice.header}] [${choice.binding.size}] [${choice.error}]")
+        failures = failures + 1
+    }
+    return
+}
+
+fun offers(names: array<string>): string {
+    // AuthenticationSASL: the method (10) as four bytes, then each mechanism name and a zero, then a zero.
+    var body = "\x00\x00\x00\x0a"
+    for (name in names) body = "$body$name\x00"
+    "$body\x00"
+}
+
+fun config(policy: string): PgConfig = PgConfig("h", 5432, "d", "u", "p", 100, 100, "require", "", "any", "", policy)
+
+fun main: int {
+    val fake = FakeTls("BINDING")
+    pgTlsAdded.append(fake)
+    val both = offers(["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"])
+    val plain = offers(["SCRAM-SHA-256"])
+    val plusOnly = offers(["SCRAM-SHA-256-PLUS"])
+    val plusHeader = "p=tls-server-end-point,,"
+    // prefer (the default): PLUS where TLS and the server allow it; "y" says the client could have, "n" that it could not.
+    expect("prefer both", pgSaslChoose(both, config("prefer"), 7), "SCRAM-SHA-256-PLUS", plusHeader, "BINDING", "")
+    expect("prefer plus-only", pgSaslChoose(plusOnly, config("prefer"), 7), "SCRAM-SHA-256-PLUS", plusHeader, "BINDING", "")
+    expect("prefer plain server over TLS", pgSaslChoose(plain, config("prefer"), 7), "SCRAM-SHA-256", "y,,", "", "")
+    expect("prefer no TLS", pgSaslChoose(both, config("prefer"), 0), "SCRAM-SHA-256", "n,,", "", "")
+    expect("prefer no TLS, plus-only", pgSaslChoose(plusOnly, config("prefer"), 0), "", "", "",
+        "PostgreSQL did not offer a supported SASL mechanism")
+    fake.binding = ""
+    expect("prefer no binding for the certificate", pgSaslChoose(both, config("prefer"), 7), "SCRAM-SHA-256", "n,,", "", "")
+    fake.binding = "BINDING"
+    // require: only PLUS, and each way of not having it says why.
+    expect("require both", pgSaslChoose(both, config("require"), 7), "SCRAM-SHA-256-PLUS", plusHeader, "BINDING", "")
+    expect("require plain server", pgSaslChoose(plain, config("require"), 7), "", "", "",
+        "PostgreSQL channel_binding is required, but the server did not offer SCRAM-SHA-256-PLUS")
+    expect("require no TLS", pgSaslChoose(both, config("require"), 0), "", "", "",
+        "PostgreSQL channel_binding is required, but TLS is not in use")
+    fake.binding = ""
+    expect("require no binding", pgSaslChoose(both, config("require"), 7), "", "", "",
+        "PostgreSQL channel_binding is required, but the server's certificate has no tls-server-end-point binding")
+    fake.binding = "BINDING"
+    // disable: the plain mechanism and "n,," even over TLS; a PLUS-only server cannot be used.
+    expect("disable both", pgSaslChoose(both, config("disable"), 7), "SCRAM-SHA-256", "n,,", "", "")
+    expect("disable plus-only", pgSaslChoose(plusOnly, config("disable"), 7), "", "", "",
+        "PostgreSQL did not offer a supported SASL mechanism")
+    expect("unknown policy", pgSaslChoose(both, config("sometimes"), 7), "", "", "", "Unknown PostgreSQL channel_binding: sometimes")
+    if (failures == 0) println("channel binding choices ok")
+    failures
+}

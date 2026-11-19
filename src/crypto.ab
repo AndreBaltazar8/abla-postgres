@@ -100,7 +100,11 @@ fun pgScramProof(
     serverFirst: string,
     cachedSaltKey: string = "",
     cachedSaltedPassword: string = "",
-    deadline: int = 0
+    deadline: int = 0,
+    // The GS2 header of the client's first message and, with "p=...", the channel-binding data: the `c=` of the final message
+    // is the base64 of both (RFC 5802 section 7); the default "n,," is "biws".
+    gs2Header: string = "n,,",
+    binding: string = ""
 ): PgScramProof {
     var error = ""
     val clientNonce = pgScramAttribute(clientFirstBare, 114)
@@ -124,7 +128,7 @@ fun pgScramProof(
     var saltedPassword = ""
     val saltKey = "$encodedSalt/$iterations"
     if (error == "") {
-        val withoutProof = "c=biws,r=$serverNonce"
+        val withoutProof = "c=${base64Encode("$gs2Header$binding")},r=$serverNonce"
         val authMessage = "$clientFirstBare,$serverFirst,$withoutProof"
         saltedPassword = if (cachedSaltKey == saltKey && cachedSaltedPassword != "")
             cachedSaltedPassword else pgSaltedPassword(password, salt, iterations,deadline)

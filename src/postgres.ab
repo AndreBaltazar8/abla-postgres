@@ -30,7 +30,10 @@ class PgConfig(
     val targetSessionAttrs: string = "read-write",
     // Optional IPv4 TCP destination for one logical host (for example an SSH tunnel).
     // TLS still verifies host; this never changes the certificate identity.
-    val hostAddress: string = ""
+    val hostAddress: string = "",
+    // As libpq's channel_binding: prefer (SCRAM-SHA-256-PLUS when the connection is TLS and the server offers it), require
+    // (only that: any other way of authenticating is refused) or disable (plain SCRAM-SHA-256).
+    val channelBinding: string = "prefer"
 )
 
 // Keep connection policy when giving a dedicated checkpoint/lease session its
@@ -38,7 +41,7 @@ class PgConfig(
 // host-selection policy is added.
 fun pgConfigWithTimeouts(config: PgConfig, connectMilliseconds: int, readMilliseconds: int): PgConfig = PgConfig(
     config.host,config.port,config.database,config.user,config.password,
-    connectMilliseconds,readMilliseconds,config.sslMode,config.sslRootCert,config.targetSessionAttrs,config.hostAddress
+    connectMilliseconds,readMilliseconds,config.sslMode,config.sslRootCert,config.targetSessionAttrs,config.hostAddress,config.channelBinding
 )
 
 class PgCandidate(val host: string, val port: int)
@@ -75,7 +78,7 @@ fun pgCandidates(config: PgConfig): array<PgCandidate> {
 
 fun pgCandidateConfig(config: PgConfig, candidate: PgCandidate, connectMilliseconds: int): PgConfig = PgConfig(
     candidate.host,candidate.port,config.database,config.user,config.password,
-    connectMilliseconds,config.readTimeoutMilliseconds,config.sslMode,config.sslRootCert,config.targetSessionAttrs,config.hostAddress
+    connectMilliseconds,config.readTimeoutMilliseconds,config.sslMode,config.sslRootCert,config.targetSessionAttrs,config.hostAddress,config.channelBinding
 )
 
 fun pgRemaining(deadline: int, maximum: int): int {
@@ -179,6 +182,9 @@ interface PgTls {
     fun sendReady(handle: int, bytes: string, offset: int): PgTlsIo
     fun receiveReady(handle: int, maximum: int): PgTlsIo
     fun sendUntil(handle: int, bytes: string, deadline: int): int
+    // The channel binding of the handshake that finished on `handle` ("tls-server-end-point", RFC 5929): raw bytes, or "" when
+    // there is none (the certificate's signature has no single hash, or the TLS has no such thing).
+    fun channelBinding(handle: int, kind: string): string
 }
 val pgTlsAdded: array<PgTls> = []
 
@@ -287,7 +293,9 @@ fun pgConfigFromEnvironment(): PgConfig = PgConfig(
     pgParsePositiveInt(pgEnvironment("POSTGRES_READ_TIMEOUT_MS", "5000"), 5000),
     pgEnvironment("POSTGRES_SSLMODE", "disable"),
     pgEnvironment("POSTGRES_SSLROOTCERT", ""),
-    pgEnvironment("POSTGRES_TARGET_SESSION_ATTRS", "read-write")
+    pgEnvironment("POSTGRES_TARGET_SESSION_ATTRS", "read-write"),
+    "",
+    pgEnvironment("POSTGRES_CHANNEL_BINDING", "prefer")
 )
 
 fun pgAppendU16(var bytes: array<int>, value: int): void {
@@ -568,9 +576,9 @@ fun pgPasswordMessage(value: string): string {
     pgTypedMessage(112, body)
 }
 
-fun pgSaslInitialMessage(initial: string): string {
+fun pgSaslInitialMessage(initial: string, mechanism: string = "SCRAM-SHA-256"): string {
     val body: array<int> = []
-    pgAppendCString(body, "SCRAM-SHA-256")
+    pgAppendCString(body, mechanism)
     pgAppendU32(body, initial.size)
     pgAppendText(body, initial)
     pgTypedMessage(112, body)
@@ -594,6 +602,38 @@ fun pgAuthenticationOffers(body: string, mechanism: string): bool {
     found
 }
 
+// What the SCRAM exchange will be, from the mechanisms the server offered (libpq's channel_binding):
+// `mechanism` the one sent, `header` its GS2 header (RFC 5802: "p=<type>,," binds, "y,," says the client could have but the
+// server did not offer, so a server that did offer it and was stripped of it by a man in the middle refuses, "n,," the
+// client does not), `binding` the cbind-data that goes into the client's final message (only with "p="), `error` why not.
+class PgSaslChoice(val mechanism: string, val header: string, val binding: string, val error: string)
+
+val PG_BINDING_TYPE: string = "tls-server-end-point"
+
+fun pgSaslChoose(offers: string, config: PgConfig, tlsHandle: int): PgSaslChoice {
+    val policy = config.channelBinding
+    if (policy != "prefer" && policy != "require" && policy != "disable") {
+        return PgSaslChoice("", "", "", "Unknown PostgreSQL channel_binding: $policy")
+    }
+    val plus = pgAuthenticationOffers(offers, "SCRAM-SHA-256-PLUS")
+    val plain = pgAuthenticationOffers(offers, "SCRAM-SHA-256")
+    val secure = tlsHandle != 0 && pgTlsAdded.size > 0
+    val binding = if (secure && policy != "disable") pgTlsAdded[0].channelBinding(tlsHandle, PG_BINDING_TYPE) else ""
+    if (policy != "disable" && plus && binding != "") {
+        return PgSaslChoice("SCRAM-SHA-256-PLUS", "p=$PG_BINDING_TYPE,,", binding, "")
+    }
+    if (policy == "require") {
+        val why = if (!secure) "TLS is not in use"
+            else if (!plus) "the server did not offer SCRAM-SHA-256-PLUS"
+            else "the server's certificate has no $PG_BINDING_TYPE binding"
+        return PgSaslChoice("", "", "", "PostgreSQL channel_binding is required, but $why")
+    }
+    if (!plain) return PgSaslChoice("", "", "", "PostgreSQL did not offer a supported SASL mechanism")
+    PgSaslChoice("SCRAM-SHA-256", if (binding != "" && !plus) "y,," else "n,,", "", "")
+}
+
+val PG_BINDING_REFUSED = "PostgreSQL channel_binding is required, but the server authenticated the client without channel binding"
+
 fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): string {
     var error = ""
     if (stream.connection.descriptor < 0 && stream.tls == 0) {
@@ -607,6 +647,9 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): s
         var clientFirstBare = ""
         var expectedServerSignature = ""
         var scramVerified = false
+        var gs2Header = "n,,"
+        var binding = ""
+        var bound = false
         while (!ready && error == "") {
             val message = stream.next(config.readTimeoutMilliseconds,deadline,65536)
             if (!message.valid) error = if(message.kind==pgOversizedMessage) "PostgreSQL authentication message exceeded64KiB" else "Timed out during PostgreSQL startup"
@@ -619,10 +662,14 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): s
                     if (method == 0) {
                         if (clientFirstBare != "" && !scramVerified) {
                             error = "PostgreSQL completed SCRAM without a verified server proof"
+                        } else if (config.channelBinding == "require" && !bound) {
+                            error = PG_BINDING_REFUSED
                         } else authenticationOk = true
                     } else if (method == 3) {
                         if (passwordResponseSent) {
                             error = "PostgreSQL requested a duplicate password response"
+                        } else if (config.channelBinding == "require") {
+                            error = PG_BINDING_REFUSED
                         } else {
                             passwordResponseSent = true
                             if (stream.sendWithin(
@@ -632,6 +679,8 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): s
                     } else if (method == 5) {
                         if (passwordResponseSent || message.body.size != 8) {
                             error = "PostgreSQL sent an invalid MD5 password challenge"
+                        } else if (config.channelBinding == "require") {
+                            error = PG_BINDING_REFUSED
                         } else {
                             passwordResponseSent = true
                             val response = pgMd5PasswordResponse(
@@ -644,11 +693,11 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): s
                             ) < 0) error = "Could not send PostgreSQL MD5 password response"
                         }
                     } else if (method == 10) {
-                        if (clientFirstBare != "" ||
-                            !pgAuthenticationOffers(
-                                message.body, "SCRAM-SHA-256"
-                            )) {
+                        val choice = pgSaslChoose(message.body, config, stream.tls)
+                        if (clientFirstBare != "") {
                             error = "PostgreSQL did not offer a supported SASL mechanism"
+                        } else if (choice.error != "") {
+                            error = choice.error
                         } else {
                             val nonce = pgSecureNonce()
                             if (nonce == "") {
@@ -656,9 +705,12 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): s
                             } else {
                                 clientFirstBare =
                                     "n=${pgSaslName(config.user)},r=$nonce"
-                                val initial = "n,,$clientFirstBare"
+                                gs2Header = choice.header
+                                binding = choice.binding
+                                bound = choice.binding != ""
+                                val initial = "$gs2Header$clientFirstBare"
                                 if (stream.sendWithin(
-                                    pgSaslInitialMessage(initial),deadline
+                                    pgSaslInitialMessage(initial, choice.mechanism),deadline
                                 ) < 0) error = "Could not begin PostgreSQL SCRAM authentication"
                             }
                         }
@@ -670,7 +722,8 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): s
                             val proof = pgScramProof(
                                 config.password,
                                 clientFirstBare,
-                                message.body.slice(4, message.body.size),"","",deadline
+                                message.body.slice(4, message.body.size),"","",deadline,
+                                gs2Header,binding
                             )
                             if (proof.error != "") error = proof.error
                             else {

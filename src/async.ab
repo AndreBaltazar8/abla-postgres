@@ -119,7 +119,10 @@ resource class PgPool(
     val connTlsReadWait: array<int>,
     val resolvedCandidates: array<string>,
     val connAddresses: array<string>,
-    val connNotifications: array<string>
+    val connNotifications: array<string>,
+    // The GS2 header and the channel-binding data of a connection's SCRAM exchange (postgres.ab pgSaslChoose).
+    val connGs2Headers: array<string>,
+    val connBindings: array<string>
 ) {
     fun drop(): void {
         var slot = 0
@@ -143,7 +146,7 @@ fun pgPool(config: PgConfig, options: PgPoolOptions = PgPoolOptions()): PgPool =
         [], [], [], [], [], [], [],
         [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [],
         [], [],
-        [], [], [], [], 1, 0, "", "", "", 0, 0, [], 0, 0, [], [], [], [], [], []
+        [], [], [], [], 1, 0, "", "", "", 0, 0, [], 0, 0, [], [], [], [], [], [], [], []
     )
 
 // Transfer only an idle, fully authenticated connection with no queued work.
@@ -529,6 +532,8 @@ fun PgPool.openConnection(): int {
         this.connClientFirst.append("")
         this.connServerSignature.append("")
         this.connScramVerified.append(false)
+        this.connGs2Headers.append("n,,")
+        this.connBindings.append("")
         this.connPasswordSent.append(false)
         this.connAuthenticated.append(false)
         this.connColumns.append([])
@@ -558,6 +563,8 @@ fun PgPool.openConnection(): int {
     this.connClientFirst[slot] = ""
     this.connServerSignature[slot] = ""
     this.connScramVerified[slot] = false
+    this.connGs2Headers[slot] = "n,,"
+    this.connBindings[slot] = ""
     this.connPasswordSent[slot] = false
     this.connAuthenticated[slot] = false
     this.route(descriptor, slot)
@@ -582,7 +589,11 @@ fun PgPool.handleAuthentication(slot: int, kind: int, body: string): void {
         if (method == 0) {
             if (this.connClientFirst[slot] != "" && !this.connScramVerified[slot]) {
                 this.closeConnection(slot, "PostgreSQL completed SCRAM without a verified server proof")
+            } else if (this.config.channelBinding == "require" && this.connBindings[slot] == "") {
+                this.closeConnection(slot, PG_BINDING_REFUSED)
             } else this.connAuthenticated[slot] = true
+        } else if ((method == 3 || method == 5) && this.config.channelBinding == "require") {
+            this.closeConnection(slot, PG_BINDING_REFUSED)
         } else if (method == 3 && !this.connPasswordSent[slot]) {
             this.connPasswordSent[slot] = true
             this.queueOutput(slot, pgPasswordMessage(this.config.password))
@@ -591,22 +602,29 @@ fun PgPool.handleAuthentication(slot: int, kind: int, body: string): void {
             this.queueOutput(slot, pgPasswordMessage(pgMd5PasswordResponse(
                 this.config.user, this.config.password, body.slice(4, 8)
             )))
-        } else if (method == 10 && this.connClientFirst[slot] == "" &&
-            pgAuthenticationOffers(body, "SCRAM-SHA-256")) {
+        } else if (method == 10 && this.connClientFirst[slot] == "") {
+            val choice = pgSaslChoose(body, this.config, this.connTls[slot])
+            if (choice.error != "") {
+                this.closeConnection(slot, choice.error)
+                return
+            }
             val nonce = pgSecureNonce()
             if (nonce == "") {
                 this.closeConnection(slot, "Could not generate a secure PostgreSQL SCRAM nonce")
                 return
             }
             this.connClientFirst[slot] = "n=${pgSaslName(this.config.user)},r=$nonce"
-            this.queueOutput(slot, pgSaslInitialMessage("n,,${this.connClientFirst[slot]}"))
+            this.connGs2Headers[slot] = choice.header
+            this.connBindings[slot] = choice.binding
+            this.queueOutput(slot, pgSaslInitialMessage("${choice.header}${this.connClientFirst[slot]}", choice.mechanism))
         } else if (method == 11 && this.connClientFirst[slot] != "" &&
             this.connServerSignature[slot] == "") {
             // Every session of the role shares the salt and iteration count, so
             // the PBKDF2 derivation runs once per pool, not once per session.
             val proof = pgScramProof(
                 this.config.password, this.connClientFirst[slot], body.slice(4, body.size),
-                this.scramSaltKey, this.scramSaltedPassword,this.connDeadlines[slot]
+                this.scramSaltKey, this.scramSaltedPassword,this.connDeadlines[slot],
+                this.connGs2Headers[slot], this.connBindings[slot]
             )
             if (proof.error != "") this.closeConnection(slot, proof.error)
             else {

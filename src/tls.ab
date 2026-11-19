@@ -153,6 +153,11 @@ class PgPureTls(var reason: string) : PgTls {
         }
         text
     }
+    fun channelBinding(handle: int, kind: string): string {
+        val at = pgPureIndex(handle)
+        if (at < 0) ""
+        else pgPureSessions[at].session.channelBinding(kind)
+    }
     // close_notify is offered once and never waited for, then the socket is closed.
     fun close(handle: int): void {
         val at = pgPureIndex(handle)

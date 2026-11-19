@@ -1,5 +1,6 @@
 import "../src/crypto.ab"
 import "abla/crypto"
+import "abla/text"
 
 fun main: int {
     val hmac = hmacSha256(
@@ -36,5 +37,12 @@ fun main: int {
         "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF\$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=") 160
     else if (scram.serverSignature !=
         "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=") 170
+    else if (pgScramProof("pencil", "n=user,r=rOprNGfwEbeRWgbNEkqO",
+        "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF\$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", "", "", 0,
+        "p=tls-server-end-point,,", "\x01\x02\x03").clientFinal.slice(0, 2 + base64Encode("p=tls-server-end-point,,\x01\x02\x03").size) !=
+        "c=${base64Encode("p=tls-server-end-point,,\x01\x02\x03")}") 180
+    else if (!pgScramProof("pencil", "n=user,r=rOprNGfwEbeRWgbNEkqO",
+        "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF\$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", "", "", 0,
+        "y,,", "").clientFinal.startsWith("c=eSws,r=")) 190
     else 0
 }

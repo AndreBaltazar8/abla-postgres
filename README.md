@@ -73,6 +73,25 @@ a `PgConfig`'s `sslMode` and `sslRootCert`, or `POSTGRES_SSLMODE` and `POSTGRES_
 There's no fallback: a server without TLS, a certificate that doesn't check out, or a program that asks without
 having added it gets an error, not a plain connection. Nothing here links OpenSSL. The async pool uses the same TLS policy through nonblocking SSLRequest, handshake, authentication and query states. `detachConnection(slot)` transfers both the fd and its TLS handle for a dedicated LISTEN connection; copying only an fd is insufficient. A pool can receive `resolvedCandidates` from an off-loop resolver while retaining the original host names for certificate checks.
 
+### Channel binding (SCRAM-SHA-256-PLUS)
+
+Over TLS, SCRAM can bind the password exchange to the TLS connection (RFC 5802, `tls-server-end-point` of RFC 5929, which
+is what PostgreSQL implements): a man in the middle that terminates TLS with its own certificate and relays the exchange
+to the real server is refused by the server. `PgConfig.channelBinding` or `POSTGRES_CHANNEL_BINDING` takes libpq's
+`channel_binding` values:
+
+- `prefer`, the default: use `SCRAM-SHA-256-PLUS` when the connection is TLS and the server offers it, else plain
+  `SCRAM-SHA-256` (and, over TLS, say so with the GS2 flag `y`, so that a server that did offer PLUS refuses a stripped
+  offer);
+- `require`: only PLUS. Without TLS, without PLUS in the server's offer, or with any other authentication (trust,
+  password, MD5, plain SCRAM) the connection is refused;
+- `disable`: plain `SCRAM-SHA-256`, never bound.
+
+The binding needs a certificate whose signature has one hash (RSA PKCS#1 and ECDSA with SHA-256/384/512); an Ed25519
+certificate has none, and then `prefer` uses plain SCRAM and `require` refuses. `tools/test-postgres.sh` runs PostgreSQL 16
+through a TLS-terminating relay with another certificate (refused), a relay that strips PLUS from the offer (refused),
+and one that leaves PLUS only (works).
+
 ## Querying
 
 Configuration follows the variables used by the official PostgreSQL image:
@@ -327,8 +346,7 @@ deprecated by PostgreSQL. Cleartext `password` authentication should only be
 used over TLS. `trust` is
 appropriate only for tightly controlled test networks.
 
-SCRAM-SHA-256-PLUS requires TLS channel binding and is therefore not offered
-until TLS lands. GSSAPI, SSPI, LDAP, PAM, peer, and certificate authentication
+SCRAM-SHA-256-PLUS (channel binding) is used over TLS, see above. GSSAPI, SSPI, LDAP, PAM, peer, and certificate authentication
 are server/infrastructure mechanisms rather than PostgreSQL password exchanges
 and are outside this client module.
 

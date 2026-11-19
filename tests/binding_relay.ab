@@ -1,0 +1,136 @@
+// A test relay between a client and a PostgreSQL server, both over TLS: the attacker of channel binding. It answers the
+// client's SSLRequest, terminates TLS with the certificate it was given (the server's own, or another), opens its own TLS to
+// the server and passes the bytes both ways. The mode changes what the server's authentication request offers:
+//   pass        nothing: a relay that only terminates TLS (with another certificate it is a man in the middle)
+//   strip-plus  SCRAM-SHA-256-PLUS is removed from the mechanisms (the downgrade: the client must not take it)
+//   plus-only   only SCRAM-SHA-256-PLUS is left (a server that insists on channel binding)
+//   binding_relay <certificate.pem> <key.pem> <listen port> <server port> <mode>      it serves connections until killed.
+import "abla/io"
+import "abla/text"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/sys/linux/net"
+import "abla/tls/pure"
+import "abla/tls/pure/server"
+import "../src/postgres.ab"
+
+// The AuthenticationSASL message (R, method 10) with its mechanism list changed per the mode; others as they are.
+fun relayRewrite(message: string, mode: string): string {
+    if (message.size < 9 || message[0] != 82 || pgReadU32(message, 5) != 10) return message
+    val body: array<int> = []
+    pgAppendU32(body, 10)
+    var index = 9
+    while (index < message.size && message[index] != 0) {
+        val begin = index
+        while (index < message.size && message[index] != 0) index = index + 1
+        val name = message.slice(begin, index)
+        val plus = name == "SCRAM-SHA-256-PLUS"
+        if (mode == "pass" || (mode == "strip-plus" && !plus) || (mode == "plus-only" && plus)) pgAppendCString(body, name)
+        index = index + 1
+    }
+    body.append(0)
+    pgTypedMessage(82, body)
+}
+
+// Complete messages at the front of `bytes`: how many bytes they take (0 if the first is not whole yet).
+fun relayWhole(bytes: string): int {
+    if (bytes.size < 5) return 0
+    val end = 1 + pgReadU32(bytes, 1)
+    if (end <= bytes.size) end else 0
+}
+
+fun relayServe(client: TcpConnection, config: TlsServerConfig, serverPort: int, mode: string): void {
+    // The client's SSLRequest, then TLS here; the same toward the server.
+    val request = client.readWithTimeoutResult(8, 5000).bytes
+    if (request.size != 8) return
+    client.write("S")
+    val upstream = tcpConnectIpv4("127.0.0.1", serverPort, 3000)
+    if (upstream.descriptor < 0) return
+    upstream.write("\x00\x00\x00\x08\x04\xd2\x16\x2f")
+    if (upstream.readWithTimeoutResult(1, 3000).bytes != "S") return
+    linuxSocketSetNonblocking(client.descriptor, true)
+    linuxSocketSetNonblocking(upstream.descriptor, true)
+    val down = tlsServerSession(config, client.descriptor)
+    val up = tlsSessionClient(upstream.descriptor, "127.0.0.1", TLS_VERIFY_NONE)
+    var downReady = false
+    var upReady = false
+    var toServer = ""
+    var toClient = ""
+    var held = ""
+    var framing = mode != "pass"
+    var alive = true
+    var idle = 0
+    while (alive && idle < 6000) {
+        var progress = false
+        if (!downReady) {
+            val status = down.handshake()
+            if (status == 1) { downReady = true; progress = true } else if (status < 0) alive = false
+        }
+        if (!upReady) {
+            val status = up.handshake()
+            if (status == 1) { upReady = true; progress = true } else if (status < 0) alive = false
+        }
+        if (downReady && upReady) {
+            val fromClient = down.readReady(65536)
+            if (fromClient.status == 1 && fromClient.bytes.size > 0) { toServer = "$toServer${fromClient.bytes}"; progress = true }
+            else if (fromClient.status == 0 || fromClient.status < 0) alive = false
+            val fromServer = up.readReady(65536)
+            if (fromServer.status == 1 && fromServer.bytes.size > 0) {
+                progress = true
+                if (framing) held = "$held${fromServer.bytes}" else toClient = "$toClient${fromServer.bytes}"
+            } else if (fromServer.status == 0 || fromServer.status < 0) alive = false
+            // Until the authentication request is through, the server's bytes are taken message by message.
+            while (framing && relayWhole(held) > 0) {
+                val end = relayWhole(held)
+                val message = held.slice(0, end)
+                held = held.slice(end, held.size)
+                toClient = "$toClient${relayRewrite(message, mode)}"
+                if (message[0] == 82 && pgReadU32(message, 5) == 10) {
+                    framing = false
+                    toClient = "$toClient$held"
+                    held = ""
+                }
+            }
+            if (toServer.size > 0) {
+                val sent = up.writeReady(toServer, 0)
+                if (sent.written > 0) { toServer = toServer.slice(sent.written, toServer.size); progress = true }
+                if (sent.status < 0) alive = false
+            }
+            if (toClient.size > 0) {
+                val sent = down.writeReady(toClient, 0)
+                if (sent.written > 0) { toClient = toClient.slice(sent.written, toClient.size); progress = true }
+                if (sent.status < 0) alive = false
+            }
+        }
+        if (progress) idle = 0 else {
+            idle = idle + 1
+            linuxPollSocket(client.descriptor, true, false, 1)
+        }
+    }
+    down.close()
+    up.close()
+    linuxTcpCloseDescriptor(client.descriptor)
+    linuxTcpCloseDescriptor(upstream.descriptor)
+    return
+}
+
+fun main: int {
+    if (processArgumentCount() < 5) {
+        println("usage: binding_relay <certificate.pem> <key.pem> <listen port> <server port> <pass|strip-plus|plus-only>")
+        return 2
+    }
+    val certificate = linuxReadFile(processArgument(0), 65536)
+    val key = linuxReadFile(processArgument(1), 65536)
+    val config = tlsServerConfigFromPem(certificate, key)
+    if (config == null) {
+        println("the certificate or key is not usable")
+        return 2
+    }
+    val listener = tcpListen(pgParsePositiveInt(processArgument(2), 0))
+    println("relay ready")
+    while (true) {
+        val client = listener.accept()
+        if (client.descriptor >= 0) relayServe(client, config, pgParsePositiveInt(processArgument(3), 0), processArgument(4))
+    }
+    0
+}

@@ -1,0 +1,37 @@
+// One query by the blocking client and one by the pool, with the connection the environment describes (POSTGRES_HOST, PORT,
+// USER, PASSWORD, SSLMODE, CHANNEL_BINDING): "ok", or "refused: <why>" from whichever failed first.
+import "../src/async.ab"
+import "../src/tls.ab"
+import "abla/io"
+import "../src/postgres.ab"
+import "abla/sys/linux/process"
+
+fun main: int {
+    pgTlsEnable()
+    val config = pgConfigFromEnvironment()
+    val blocking = pgQuery(config, "SELECT 1::text AS one")
+    if (!blocking.succeeded) {
+        println("refused: ${blocking.error}")
+        return 1
+    }
+    val pool = pgPool(config, PgPoolOptions(1, 8000, 3000))
+    val id = pool.query("SELECT 1::text AS one")
+    val deadline = linuxMonotonicMilliseconds() + 10000
+    var done = false
+    var failed = ""
+    while (!done && linuxMonotonicMilliseconds() < deadline) {
+        pool.step(10)
+        for (result in pool.takeResults()) if (result.id == id) {
+            done = true
+            if (!result.result.succeeded) failed = result.result.error
+        }
+    }
+    pool.drop()
+    if (!done) failed = "the pool gave no answer"
+    if (failed != "") {
+        println("refused: $failed")
+        return 1
+    }
+    println("ok")
+    0
+}
