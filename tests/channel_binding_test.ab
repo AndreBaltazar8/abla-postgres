@@ -4,7 +4,6 @@
 import "../src/postgres.ab"
 import "abla/io"
 import "abla/sys/linux/net"
-import "abla/text"
 
 class FakeTls(var binding: string) : PgTls {
     fun upgrade(var connection: TcpConnection, host: string, mode: string, rootCert: string, timeoutMilliseconds: int): int = 0

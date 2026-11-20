@@ -6,7 +6,6 @@
 //   plus-only   only SCRAM-SHA-256-PLUS is left (a server that insists on channel binding)
 //   binding_relay <certificate.pem> <key.pem> <listen port> <server port> <mode>      it serves connections until killed.
 import "abla/io"
-import "abla/text"
 import "abla/process/arguments"
 import "abla/sys/linux"
 import "abla/sys/linux/net"
