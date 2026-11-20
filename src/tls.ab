@@ -12,7 +12,7 @@ import "abla/sys/linux/process"
 
 // A session and what the blocking calls (send, receive) bound themselves by. The handle of a session is its descriptor plus
 // one, so that 0 can say "no TLS", and the table is the only owner of the descriptor until close.
-class PgPureEntry(var session: TlsSession, val handle: int, val timeoutMilliseconds: int)
+class PgPureEntry(var session: TlsSession, val handle: int, var timeoutMilliseconds: int)
 
 val pgPureSessions: array<PgPureEntry> = []
 
@@ -45,7 +45,7 @@ class PgPureTls(var reason: string) : PgTls {
             return 0
         }
         val handle = descriptor + 1
-        pgPureSessions.append(PgPureEntry(session, handle, 10000))
+        pgPureSessions.append(PgPureEntry(move(session), handle, 10000))
         handle
     }
     fun handshake(handle: int): int {
@@ -119,7 +119,7 @@ class PgPureTls(var reason: string) : PgTls {
             return 0
         }
         val at = pgPureIndex(handle)
-        pgPureSessions[at] = PgPureEntry(pgPureSessions[at].session, handle, timeoutMilliseconds)
+        pgPureSessions[at].timeoutMilliseconds = timeoutMilliseconds
         connection.descriptor = -1
         handle
     }
