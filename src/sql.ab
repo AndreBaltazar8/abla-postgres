@@ -1,0 +1,39 @@
+// Optional checked-SQL adapters. All transport, cache, transaction and uncertain
+// outcome behavior stays in the existing string/parameter entry points.
+import "postgres.ab"
+import "async.ab"
+import "abla/sql"
+
+fun pgSqlParameters(statement: SqlStatement): array<PgParameter> {
+    val parameters: array<PgParameter> = []
+    for (parameter in statement.parameters) {
+        parameters.append(PgParameter(parameter.value, parameter.isNull))
+    }
+    parameters
+}
+
+fun PgClient.query(statement: SqlStatement, timeoutMilliseconds: int = 0): PgResult =
+    this.query(statement.text, pgSqlParameters(statement), timeoutMilliseconds)
+
+fun PgClient.execute(statement: SqlStatement, timeoutMilliseconds: int = 0): PgResult =
+    this.execute(statement.text, pgSqlParameters(statement), timeoutMilliseconds)
+
+fun PgPool.query(statement: SqlStatement, transaction: int = 0,
+    timeoutMilliseconds: int = 0): int =
+    this.query(statement.text, pgSqlParameters(statement), transaction, timeoutMilliseconds)
+
+fun PgPool.execute(statement: SqlStatement, transaction: int = 0,
+    timeoutMilliseconds: int = 0): int =
+    this.execute(statement.text, pgSqlParameters(statement), transaction, timeoutMilliseconds)
+
+fun pgSqlQuery(config: PgConfig, statement: SqlStatement,
+    timeoutMilliseconds: int = 0): PgResult =
+    pgQuery(config, statement.text, pgSqlParameters(statement), timeoutMilliseconds)
+
+fun pgSqlExecute(config: PgConfig, statement: SqlStatement,
+    timeoutMilliseconds: int = 0): PgResult =
+    pgExecute(config, statement.text, pgSqlParameters(statement), timeoutMilliseconds)
+
+fun pgSqlSessionQuery(config: PgConfig, state: PgSessionState, statement: SqlStatement,
+    timeoutMilliseconds: int = 0): PgSessionResult =
+    pgSessionQuery(config, state, statement.text, pgSqlParameters(statement), timeoutMilliseconds)

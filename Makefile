@@ -22,3 +22,8 @@ check:
 
 test:
 	./tools/test-postgres.sh
+
+# Optional until the compiler release containing abla/sql is installed.
+.PHONY: test-sql
+test-sql:
+	ABLAC=$(COMPILER) ./tools/test-sql.sh

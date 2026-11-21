@@ -1,0 +1,84 @@
+import "../src/sql.ab"
+import "../src/postgres.ab"
+import "../src/async.ab"
+import "abla/sql"
+import "abla/io"
+import "abla/sys/linux/net"
+
+var failures = 0
+fun checkSql(name: string, ok: bool): void {
+    if (!ok) { println("FAIL $name"); failures += 1 }
+}
+
+fun main: int {
+    val attack = "x'); DROP TABLE abla_checked_sql; --"
+    val none: string? = null
+    val statement = $sql("SELECT ${attack}::text AS value, ${none}::text AS optional, ${sqlInt8Text("9223372036854775807")}::bigint::text AS large")
+    val parameters = pgSqlParameters(statement)
+    checkSql("parameter conversion", parameters.size == 3 && parameters[0].value == attack && parameters[1].isNull)
+    val config = pgConfigFromEnvironment()
+    val client = pgClient(config)
+    checkSql("setup", client.execute("CREATE TABLE IF NOT EXISTS abla_checked_sql (id integer PRIMARY KEY, value text)").succeeded)
+    checkSql("insert", client.execute($sql("INSERT INTO abla_checked_sql(id,value) VALUES (${1}::integer,${attack}::text) ON CONFLICT(id) DO UPDATE SET value=excluded.value")).succeeded)
+    val selected = client.query(statement)
+    checkSql("client bound values", selected.succeeded && selected.first("value") == attack && selected.cell(0, "optional").isNull && selected.first("large") == "9223372036854775807")
+    checkSql("injection kept as data", client.query($sql("SELECT value FROM abla_checked_sql WHERE id=${1}::integer")).first("value") == attack)
+    pgStatementCache(true)
+    client.query(statement)
+    client.query(statement)
+    checkSql("prepared statement cache", pgStatementCacheSize(pgCacheKey(client.stream)) > 0)
+    checkSql("server UUID validation", client.query($sql("SELECT ${"not-a-uuid"}::uuid")).sqlState == "22P02")
+    checkSql("server integer range", client.query($sql("SELECT ${2147483648}::integer")).sqlState == "22003")
+    checkSql("server encoded bigint validation", client.query($sql("SELECT ${sqlInt8Text("invalid")}::bigint")).sqlState == "22P02")
+    checkSql("server JSON validation", client.query($sql("SELECT ${sqlJsonText("invalid")}::jsonb")).sqlState == "22P02")
+    checkSql("grammar catalog", client.script("CREATE TABLE test(\"order\" integer, id uuid PRIMARY KEY, email text, world integer, value integer); CREATE TABLE worlds(id integer)").succeeded)
+    val id = "00000000-0000-0000-0000-000000000001"
+    val email = "one@example.test"
+    val n = 3
+    val grammar: array<SqlStatement> = [
+        $sql("SELECT \"order\", t.id FROM test t LEFT OUTER JOIN worlds w ON w.id=t.world WHERE t.id = ${id}::uuid AND t.value BETWEEN 1 AND 9 GROUP BY \"order\",t.id HAVING count(*)>0 ORDER BY t.id DESC NULLS LAST LIMIT ${n}::integer OFFSET 0"),
+        $sql("INSERT INTO test(id,email) VALUES (${id}::uuid,${email}::text) ON CONFLICT(id) DO UPDATE SET email=excluded.email WHERE test.email<>excluded.email RETURNING id::text"),
+        $sql("INSERT INTO test(id) VALUES (${id}::uuid),(${id}::uuid) ON CONFLICT ON CONSTRAINT test_pkey DO NOTHING"),
+        $sql("UPDATE test AS t SET email=${email}::text, world=1 FROM worlds AS w WHERE t.world=w.id RETURNING t.id, email AS updated"),
+        $sql("DELETE FROM test t USING worlds w WHERE t.world=w.id RETURNING t.*"),
+        $sql("SELECT CASE WHEN 1<2 THEN 'yes' ELSE 'no' END AS value, coalesce((SELECT max(world) FROM test),0), CAST(1 AS integer), '{\"n\":1}'::jsonb->>'n' AS n"),
+        $sql("SELECT E'a\\'}b' AS escaped, \$\$raw } ' \" text\$\$ AS body, \$tag\$another }\$tag\$ AS tagged"),
+        $sql("SELECT 1 /* outer } /* inner } */ still outer */ AS n -- } ignored closing brace\n"),
+        $sql("SELECT 1 IN (1,2), 2 NOT BETWEEN 4 AND 6, 'a' ILIKE 'a' ESCAPE '!', NULL IS NOT DISTINCT FROM NULL, NOT false OR true AND false"),
+        $sql("SELECT DISTINCT ON (id) id, email FROM test ORDER BY id, email"),
+        $sql("SELECT * FROM test WHERE EXISTS (SELECT id FROM worlds WHERE worlds.id=test.world)"),
+        $sql("SELECT * FROM (SELECT 1 AS id) AS t(id) WHERE id IN (SELECT 1);"),
+        $sql("SELECT \$json\${\"nested\":\"\$regex(\"}\$json\$::jsonb AS payload, ${"literal"}::text AS value")
+    ]
+    var grammarIndex = 0
+    for (template in grammar) {
+        val result = client.query(template)
+        checkSql("grammar $grammarIndex", result.succeeded)
+        if (!result.succeeded) println(result.error)
+        grammarIndex += 1
+    }
+    client.close()
+    checkSql("pgQuery", pgSqlQuery(config, statement).first("value") == attack)
+    checkSql("pgExecute", pgSqlExecute(config, $sql("UPDATE abla_checked_sql SET value=${"updated"}::text WHERE id=${1}::integer")).succeeded)
+    val session = pgSqlSessionQuery(config, PgSessionState(), statement)
+    checkSql("session", session.result.first("value") == attack)
+    if (session.state.descriptor >= pgSessionTls) pgTlsAdded[0].close(session.state.descriptor - pgSessionTls)
+    else linuxTcpCloseDescriptor(session.state.descriptor)
+    val pool = pgPool(config, PgPoolOptions(size = 1))
+    val query = pool.query(statement)
+    val execute = pool.execute($sql("DELETE FROM abla_checked_sql WHERE id=${1}::integer"))
+    var complete = 0
+    var steps = 0
+    while (complete < 2 && steps < 2000) {
+        pool.step(10)
+        for (item in pool.takeResults()) {
+            if (item.id == query) checkSql("pool query", item.result.first("value") == attack)
+            if (item.id == execute) checkSql("pool execute", item.result.succeeded)
+            complete += 1
+        }
+        steps += 1
+    }
+    checkSql("pool completes", complete == 2)
+    println("SQL adapter: $failures failed")
+    failures
+}

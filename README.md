@@ -361,3 +361,30 @@ and cancellation remain future additions.
 Abla Postgres is licensed under the [Mozilla Public License 2.0](LICENSE).
 
 Authentication frames are limited to64KiB. Connection deadlines include CPU derivation, startup/password/SASL writes, TLS reads/handshake and teardown. Pre-detach NOTIFY frames are retained with a256KiB per-connection bound and transferred before any partial input frame.
+
+### Checked SQL literals
+
+With a compiler that provides `abla/sql`, import the optional `src/sql.ab`
+adapter alongside the usual client or pool module:
+
+```abla
+import "abla/sql"
+import "path/to/abla-postgres/src/sql.ab"
+val statement = $sql("SELECT name FROM players WHERE id=${id}::uuid")
+val result = client.query(statement)
+```
+
+The adapter accepts neutral `SqlStatement` values for client/pool `query` and
+`execute`, `pgSqlQuery`, `pgSqlExecute` and `pgSqlSessionQuery`. It forwards the template
+and separately bound parameters to the existing extended-query APIs, preserving
+transaction, timeout, statement-cache and uncertain-outcome handling. It never
+interpolates parameter text into SQL. Raw string APIs remain available.
+Use `sqlInt8Text(value)` for a bigint already represented as text, rather than
+narrowing it through a host integer. Schema/type resolution and dynamic value
+validation remain PostgreSQL checks; see the compiler's `abla/sql` reference
+for the supported syntax subset and explicit-cast rules.
+
+`make test-sql ABLAC=/path/to/new/compiler` runs the optional adapter integration
+against a temporary local PostgreSQL 16 container. Existing checks work with
+older compiler versions because this adapter is an opt-in module. When vendoring,
+copy `src/sql.ab` with the other `src/*.ab` files and update the vendor revision.
