@@ -11,7 +11,7 @@ import "abla/sys/linux/process"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 
-fun dripServer(): int {
+trusted fun dripServer(): int {
     val parent=pgInt(linuxArgument(1))
     if(parent<=0 || linuxSyscall5(157,1,9,0,0,0)!=0 || linuxSyscall0(110)!=parent) return 2
     linuxSyscall1(37,3)
@@ -83,7 +83,7 @@ fun answer(var pool: PgPool, id: int): PgResult {
     PgResult(false,[],[],"","async TLS result deadline")
 }
 
-fun main: int {
+trusted fun main: int {
     if(linuxArgument(0)=="drip") return dripServer()
     pgTlsEnable()
     if(!dripCheck() || !dripCheck(false)) { println("TLS drip regression failed"); return 1 }

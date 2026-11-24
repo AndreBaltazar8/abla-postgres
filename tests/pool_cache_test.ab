@@ -31,7 +31,7 @@ fun reply(stream: PgStream, marker: string): void {
     stream.send("${pgTypedMessage(67,command)}${pgTypedMessage(90,[73])}")
     return
 }
-fun fixture(): int {
+trusted fun fixture(): int {
     val parent=pgInt(linuxArgument(1))
     if(parent<=0 || linuxSyscall5(157,1,9,0,0,0)!=0 || linuxSyscall0(110)!=parent) return 2
     linuxSyscall1(37,10)
@@ -84,7 +84,7 @@ fun fixture(): int {
     first.connection.close()
     0
 }
-fun stopOwned(child: LinuxChildProcess): void {
+trusted fun stopOwned(child: LinuxChildProcess): void {
     if(linuxWaitProcess(child.process,true).output!="pending") return
     if(Path("/proc/${child.process}/exe").linkTarget().replace(" (deleted)","")==Path("/proc/self/exe").linkTarget().replace(" (deleted)","")) linuxSyscall2(62,child.process,15)
     linuxWaitProcess(child.process)

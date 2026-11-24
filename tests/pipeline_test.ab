@@ -45,7 +45,7 @@ fun oneTextRow(value: string): string {
 
 // pipeline-one-sync: answers only after the single Sync, and exits 0 only if both statements came before it.
 // pipeline-lost: answers BEGIN, then the socket closes before the statement's answer and ReadyForQuery.
-fun fakeServer(): int {
+trusted fun fakeServer(): int {
     val parent=pgInt(linuxArgument(1))
     if (parent<=0 || linuxSyscall5(157,1,9,0,0,0)!=0 || linuxSyscall0(110)!=parent) return 2
     linuxSyscall1(37,3)

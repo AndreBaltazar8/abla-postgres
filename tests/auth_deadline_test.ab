@@ -9,7 +9,7 @@ import "abla/sys/linux"
 import "abla/sys/linux/process"
 import "abla/text"
 
-fun server(): int {
+trusted fun server(): int {
     val parent=pgInt(linuxArgument(1))
     if(parent<=0 || linuxSyscall5(157,1,9,0,0,0)!=0 || linuxSyscall0(110)!=parent) return 2
     linuxSyscall1(37,3)
@@ -31,7 +31,7 @@ fun server(): int {
     0
 }
 
-fun attempt(mode: string): bool {
+trusted fun attempt(mode: string): bool {
     val parent=linuxProcessId()
     val ready="build/auth-deadline-$mode-$parent.ready"
     val child=linuxCommand("/proc/$parent/exe").argument(mode).argument("$parent").output(ready).start()
