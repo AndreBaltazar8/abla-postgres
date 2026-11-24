@@ -164,7 +164,7 @@ class PgPureTls(var reason: string) : PgTls {
         if (at < 0) return
         val entry = pgPureSessions.takeAt(at)
         entry.session.close()
-        linuxSyscall1(3, entry.session.descriptor())
+        linuxTcpCloseDescriptor(entry.session.descriptor())
         return
     }
 }

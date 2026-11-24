@@ -815,10 +815,10 @@ fun PgPool.socketReady(slot: int, readable: bool, writable: bool, failed: bool):
         if(readable || failed) {
             // Read exactly the SSLRequest response, never extra plaintext that
             // could otherwise be mistaken for authenticated TLS data.
-            val buffer=nativeByteBuffer(1)
-            val n=linuxSyscall3(0,this.connDescriptors[slot],nativePointerAddress(buffer.address),1)
-            val accepted=n==1 && buffer.load(0)==83
-            buffer.close()
+            val response=SocketReceiveResult("",0)
+            linuxTcpReceiveDescriptor(this.connDescriptors[slot],1,response)
+            val n=response.status
+            val accepted=n==1 && response.text=="S"
             if(n==-11 || n==-4) return
             if(!accepted) { this.closeConnection(slot,"PostgreSQL candidate refused required TLS"); return }
             val candidate=pgCandidates(this.config)[this.connCandidates[slot]]
