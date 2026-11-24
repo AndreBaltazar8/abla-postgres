@@ -45,7 +45,6 @@ class PgAsyncResult(
     val elapsedMilliseconds: int
 )
 
-class PgAsyncRead(var text: string, var status: int)
 class PgDetachedConnection(val descriptor: int, val tls: int, val host: string, val port: int, val address: string, val buffered: string)
 
 // Connection states.
@@ -69,7 +68,7 @@ resource class PgPool(
     val config: PgConfig,
     val options: PgPoolOptions,
     val poller: SocketPoller,
-    val reader: PgAsyncRead,
+    val reader: SocketReceiveResult,
     var address: string,
     // operations
     val opIds: array<int>,
@@ -142,7 +141,7 @@ resource class PgPool(
 
 fun pgPool(config: PgConfig, options: PgPoolOptions = PgPoolOptions()): PgPool =
     PgPool(
-        config, options, socketPoller(), PgAsyncRead("", 0), "",
+        config, options, socketPoller(), SocketReceiveResult("", 0), "",
         [], [], [], [], [], [], [],
         [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [],
         [], [],
@@ -279,19 +278,6 @@ fun pgAsyncSocketError(descriptor: int): int {
     error.close()
     errorLength.close()
     result
-}
-
-trusted fun pgAsyncReceive(descriptor: int, var result: PgAsyncRead): void {
-    val stack = nativeStackAllocate(65536)
-    var measured = linuxSyscall3(0, descriptor, stack, 65536)
-    while (measured == -4) measured = linuxSyscall3(0, descriptor, stack, 65536)
-    result.status = measured
-    if (measured > 0) {
-        val target = nativeByteBuffer(measured + 1)
-        ablaUnsafeCopyMemory(nativePointerAddress(target.address), stack, measured)
-        result.text = target.adoptString(measured)
-    } else result.text = ""
-    return
 }
 
 fun pgAsyncResolve(host: string): string {
@@ -756,7 +742,7 @@ fun PgPool.readReady(slot: int): void {
         this.interest(slot,this.connOutputs[slot]!="" && this.connWriteInterest[slot])
         this.reader.status=if(result.status==1) result.written else if(result.status==2 || result.status==3) -11 else 0
         this.reader.text=result.text
-    } else pgAsyncReceive(this.connDescriptors[slot], this.reader)
+    } else linuxTcpReceiveDescriptor(this.connDescriptors[slot], 65536, this.reader)
     val status = this.reader.status
     val chunk = this.reader.text
     this.reader.text = ""
