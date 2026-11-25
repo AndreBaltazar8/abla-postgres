@@ -995,8 +995,7 @@ fun pgCacheRecord(key: int, sql: string, name: string): void {
 // Drops a name PostgreSQL refused, closing it with the next request.
 fun pgCacheDrop(key: int, sql: string): void {
     val entry = "$key|$sql"
-    val name = pgCachedNames.get(entry)
-    if (name == null) return
+    val name = pgCachedNames.get(entry) ?? return
     val closing = pgCachedClosing.get(key)
     pgCachedClosing.set(key, "${if (closing == null) "" else closing}${pgCloseStatement(name)}")
     pgCachedNames.remove(entry)
