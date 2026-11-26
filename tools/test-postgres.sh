@@ -228,11 +228,11 @@ run_tls() {
     expect refused verify-ca '' localhost
     expect refused verify-ca "$work/missing.pem" localhost
     expect refused nonsense '' localhost
-    # sslrootcert=system is the system trust store, which abla/tls/pure reads from SSL_CERT_FILE (pureTlsSessionStore): the CA of
-    # the server is trusted through it, another CA is not.
-    SSL_CERT_FILE="$work/ca.pem" expect ssl verify-full system localhost
-    SSL_CERT_FILE="$work/other.pem" expect refused verify-full system localhost
-    SSL_CERT_FILE="$work/ca.pem" expect ssl verify-ca system localhost
+    # Give the system-trust lookup the same fixture under Nix, where
+    # NIX_SSL_CERT_FILE takes precedence over SSL_CERT_FILE.
+    NIX_SSL_CERT_FILE="$work/ca.pem" SSL_CERT_FILE="$work/ca.pem" expect ssl verify-full system localhost
+    NIX_SSL_CERT_FILE="$work/other.pem" SSL_CERT_FILE="$work/other.pem" expect refused verify-full system localhost
+    NIX_SSL_CERT_FILE="$work/ca.pem" SSL_CERT_FILE="$work/ca.pem" expect ssl verify-ca system localhost
     use tunnel
     expect ssl verify-full "$work/ca.pem" pg-tunnel.example.test 127.0.0.1
     expect refused verify-full "$work/ca.pem" wrong-tunnel.example.test 127.0.0.1
