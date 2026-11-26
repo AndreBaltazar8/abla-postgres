@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Pinned Abla release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: abla_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d abla_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: AndreBaltazar8/setup-abla@79a25cd8ad8ed3079678fefff33dbce6959b9734
+        with:
+          version: '0.2.73'
+      - name: Compile and run local protocol checks
+        run: make check
+      - name: PostgreSQL integration and SQL adapter
+        env:
+          PG_TEST_SERVICE_CONTAINER: ${{ job.services.postgres.id }}
+          PG_TEST_SERVICE_PORT: ${{ job.services.postgres.ports['5432'] }}
+        run: |
+          : "${PG_TEST_SERVICE_CONTAINER:?missing PostgreSQL service ID}" "${PG_TEST_SERVICE_PORT:?missing PostgreSQL service port}"
+          make test test-sql

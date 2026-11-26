@@ -1,0 +1,86 @@
+name: Nightly ablac master
+
+on:
+  schedule:
+    - cron: '53 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-ablac-master
+  cancel-in-progress: false
+
+jobs:
+  master-downstream:
+    name: Advisory downstream suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: abla_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d abla_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: abla-postgres
+    env:
+      ABLAC: ${{ github.workspace }}/ablac/build/ablac
+      ABLA_SYSROOT: ${{ github.workspace }}/ablac
+      ABLA_NATIVE_JOBS: 2
+      ABLA_CODEGEN_JOBS: 2
+    steps:
+      - name: Check out downstream source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: abla-postgres
+          persist-credentials: false
+      - name: Check out ablac master
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: AndreBaltazar8/ablac
+          ref: master
+          path: ablac
+          persist-credentials: false
+      - name: Record the exact compiler revision
+        id: compiler
+        working-directory: ablac
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "ablac master: $sha"
+          printf 'Compiler: [%s](https://github.com/AndreBaltazar8/ablac/commit/%s)\n' "$sha" "$sha" >> "$GITHUB_STEP_SUMMARY"
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/6510408d147d8c5e6d76043e899e9251756f6a75.tar.gz
+      - name: Bootstrap the checked-out compiler from its pinned seed
+        working-directory: ablac
+        run: |
+          nix-shell shell.nix --run 'make ablac && build/ablac --version'
+          echo "$PWD/build" >> "$GITHUB_PATH"
+      - name: Compile and run local protocol checks
+        run: nix-shell ../ablac/shell.nix --run 'make check'
+      - name: PostgreSQL integration and SQL adapter
+        env:
+          PG_TEST_SERVICE_CONTAINER: ${{ job.services.postgres.id }}
+          PG_TEST_SERVICE_PORT: ${{ job.services.postgres.ports['5432'] }}
+        run: |
+          : "${PG_TEST_SERVICE_CONTAINER:?missing PostgreSQL service ID}" "${PG_TEST_SERVICE_PORT:?missing PostgreSQL service port}"
+          nix-shell ../ablac/shell.nix --run 'make test test-sql'
+      - name: Identify the compiler on failure
+        if: failure()
+        env:
+          COMPILER_SHA: ${{ steps.compiler.outputs.sha }}
+        run: |
+          echo "::error title=Nightly ablac master failed::Compiler ${COMPILER_SHA:-checkout failed}. See the failed step above."

@@ -39,16 +39,23 @@ mkdir -p "$project_dir/build"
 run_mode() {
     mode=$1
     encryption=$2
-    container="abla-postgres-$mode-$$"
-    containers="$containers $container"
-
-    docker run -d --rm --name "$container" \
-        -e POSTGRES_HOST_AUTH_METHOD=trust \
-        -e POSTGRES_DB=abla_test \
-        -p 127.0.0.1::5432 \
-        postgres:16-alpine >/dev/null
-
-    port=$(docker port "$container" 5432/tcp | sed 's/.*://')
+    owns_container=1
+    # CI supplies a disposable trust-mode service. The authentication and
+    # TLS fixtures below still use containers this script owns and configures.
+    if [ "$mode" = trust ] && [ -n "${PG_TEST_SERVICE_CONTAINER:-}" ]; then
+        owns_container=0
+        container=$PG_TEST_SERVICE_CONTAINER
+        port=${PG_TEST_SERVICE_PORT:?missing PostgreSQL service port}
+    else
+        container="abla-postgres-$mode-$$"
+        containers="$containers $container"
+        docker run -d --rm --name "$container" \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -e POSTGRES_DB=abla_test \
+            -p 127.0.0.1::5432 \
+            postgres:16-alpine >/dev/null
+        port=$(docker port "$container" 5432/tcp | sed 's/.*://')
+    fi
     attempt=0
     until docker exec "$container" pg_isready -h 127.0.0.1 -U postgres -d abla_test >/dev/null 2>&1; do
         attempt=$((attempt + 1))
@@ -148,8 +155,10 @@ run_mode() {
         containers=$(printf '%s' "$containers" | sed "s/ $reader//")
     fi
 
-    docker stop "$container" >/dev/null
-    containers=$(printf '%s' "$containers" | sed "s/ $container//")
+    if [ "$owns_container" -eq 1 ]; then
+        docker stop "$container" >/dev/null
+        containers=$(printf '%s' "$containers" | sed "s/ $container//")
+    fi
     echo "abla-postgres: $mode authentication passed"
 }
 
