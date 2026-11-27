@@ -41,7 +41,7 @@ trusted fun attempt(mode: string): bool {
     var fine=false
     if(port>0) {
         if(mode=="whole") {
-            val config=PgConfig("127.0.0.1",port,"test","test","x".repeat(1048576),200,2000)
+            val config=PgConfig("127.0.0.1",port,"test","test","x".repeat(1048576),200,2000,passwordAuthentication="always")
             val client=pgClient(config)
             val started=linuxMonotonicMilliseconds()
             val result=client.query("SELECT 1")
@@ -55,7 +55,7 @@ trusted fun attempt(mode: string): bool {
         linuxNetStoreU32(small,0,4096)
         linuxSyscall5(54,stream.connection.descriptor,1,7,nativePointerAddress(small.address),4)
         small.close()
-        val config=PgConfig("127.0.0.1",port,"test","test","x".repeat(1048576),200,2000,"disable","","any")
+        val config=PgConfig("127.0.0.1",port,"test","test","x".repeat(1048576),200,2000,"disable","","any",passwordAuthentication="always")
         val started=linuxMonotonicMilliseconds()
         val error=pgAuthenticate(stream,config,started+200)
         val elapsed=linuxMonotonicMilliseconds()-started

@@ -37,7 +37,11 @@ class PgConfig(
     // The bytes of the rows one query may return (their DataRow messages, over all statements of a pipeline): past it the query fails and the
     // connection closes, so a server, or anyone on a path it does not authenticate, cannot stream rows until the client runs out of memory.
     // Read larger results in pieces (LIMIT, a cursor).
-    val maximumResultBytes: int = pgDefaultMaximumResultBytes
+    val maximumResultBytes: int = pgDefaultMaximumResultBytes,
+    // Whether the client answers a server that asks for the password itself (cleartext) or its MD5: "verified" (the default) only when
+    // sslmode is verify-ca or verify-full, so only a server whose certificate was checked can ask; "always" as libpq does by default;
+    // "never". SCRAM never sends the password and is not affected.
+    val passwordAuthentication: string = "verified"
 )
 
 // Keep connection policy when giving a dedicated checkpoint/lease session its
@@ -46,7 +50,7 @@ class PgConfig(
 fun pgConfigWithTimeouts(config: PgConfig, connectMilliseconds: int, readMilliseconds: int): PgConfig = PgConfig(
     config.host,config.port,config.database,config.user,config.password,
     connectMilliseconds,readMilliseconds,config.sslMode,config.sslRootCert,config.targetSessionAttrs,config.hostAddress,config.channelBinding,
-    config.maximumResultBytes
+    config.maximumResultBytes,config.passwordAuthentication
 )
 
 class PgCandidate(val host: string, val port: int)
@@ -84,7 +88,7 @@ fun pgCandidates(config: PgConfig): array<PgCandidate> {
 fun pgCandidateConfig(config: PgConfig, candidate: PgCandidate, connectMilliseconds: int): PgConfig = PgConfig(
     candidate.host,candidate.port,config.database,config.user,config.password,
     connectMilliseconds,config.readTimeoutMilliseconds,config.sslMode,config.sslRootCert,config.targetSessionAttrs,config.hostAddress,config.channelBinding,
-    config.maximumResultBytes
+    config.maximumResultBytes,config.passwordAuthentication
 )
 
 fun pgRemaining(deadline: int, maximum: int): int {
@@ -301,7 +305,8 @@ fun pgConfigFromEnvironment(): PgConfig = PgConfig(
     pgEnvironment("POSTGRES_SSLROOTCERT", ""),
     pgEnvironment("POSTGRES_TARGET_SESSION_ATTRS", "read-write"),
     "",
-    pgEnvironment("POSTGRES_CHANNEL_BINDING", "prefer")
+    pgEnvironment("POSTGRES_CHANNEL_BINDING", "prefer"),
+    passwordAuthentication = pgEnvironment("POSTGRES_PASSWORD_AUTHENTICATION", "verified")
 )
 
 fun pgAppendU16(var bytes: array<int>, value: int): void {
@@ -641,7 +646,19 @@ fun pgSaslChoose(offers: string, config: PgConfig, tlsHandle: int): PgSaslChoice
     PgSaslChoice("SCRAM-SHA-256", if (binding != "" && !plus) "y,," else "n,,", "", "")
 }
 
-val PG_BINDING_REFUSED = "PostgreSQL channel_binding is required, but the server authenticated the client without channel binding"
+// Why the client won't answer a cleartext (method 3) or MD5 (method 5) password request, or "": see PgConfig.passwordAuthentication.
+// Without a verified certificate, whoever answers the connection can ask for the password in place of the server's SCRAM.
+fun pgPasswordProblem(config: PgConfig, method: int): string {
+    val policy = config.passwordAuthentication
+    val kind = if (method == 3) "the password in cleartext" else "an MD5 password response"
+    if (policy == "always") return ""
+    if (policy == "verified" && (config.sslMode == "verify-ca" || config.sslMode == "verify-full")) return ""
+    if (policy != "verified" && policy != "never") return "Unknown PostgreSQL passwordAuthentication: $policy"
+    if (policy == "never") return "PostgreSQL asked for $kind, which passwordAuthentication \"never\" refuses"
+    "PostgreSQL asked for $kind over a connection whose server is not verified (sslmode ${config.sslMode}): use SCRAM (scram-sha-256 in pg_hba.conf), sslmode verify-full, or passwordAuthentication \"always\""
+}
+
+val PG_BINDING_REFUSED ="PostgreSQL channel_binding is required, but the server authenticated the client without channel binding"
 
 fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): string {
     var error = ""
@@ -679,6 +696,8 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): s
                             error = "PostgreSQL requested a duplicate password response"
                         } else if (config.channelBinding == "require") {
                             error = PG_BINDING_REFUSED
+                        } else if (pgPasswordProblem(config, 3) != "") {
+                            error = pgPasswordProblem(config, 3)
                         } else {
                             passwordResponseSent = true
                             if (stream.sendWithin(
@@ -690,6 +709,8 @@ fun pgAuthenticate(var stream: PgStream, config: PgConfig, deadline: int = 0): s
                             error = "PostgreSQL sent an invalid MD5 password challenge"
                         } else if (config.channelBinding == "require") {
                             error = PG_BINDING_REFUSED
+                        } else if (pgPasswordProblem(config, 5) != "") {
+                            error = pgPasswordProblem(config, 5)
                         } else {
                             passwordResponseSent = true
                             val response = pgMd5PasswordResponse(

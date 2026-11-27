@@ -19,6 +19,8 @@ check:
 	build/auth-deadline-test
 	$(COMPILER) build tests/result_limit_test.ab -o build/result-limit-test --fast --no-cache
 	build/result-limit-test
+	$(COMPILER) build tests/password_auth_test.ab -o build/password-auth-test --fast --no-cache
+	build/password-auth-test
 	$(COMPILER) build tests/pool_cache_test.ab -o build/pool-cache-test --fast --no-cache
 	build/pool-cache-test
 

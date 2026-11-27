@@ -20,6 +20,8 @@ mkdir -p "$project_dir/build"
 "$project_dir/build/host-address-test"
 "$compiler" build "$project_dir/tests/result_limit_test.ab" -o "$project_dir/build/result-limit-test" --fast --no-cache
 (cd "$project_dir" && build/result-limit-test)
+"$compiler" build "$project_dir/tests/password_auth_test.ab" -o "$project_dir/build/password-auth-test" --fast --no-cache
+(cd "$project_dir" && build/password-auth-test)
 "$compiler" build "$project_dir/tests/protocol_test.ab" \
     -o "$project_dir/build/protocol-test" --fast --no-cache
 "$compiler" build "$project_dir/tests/auth_failure_test.ab" \
@@ -41,6 +43,8 @@ mkdir -p "$project_dir/build"
 run_mode() {
     mode=$1
     encryption=$2
+    # pg_hba password and md5 ask for the password itself, over a plain connection here: the client answers only by opt-in.
+    if [ "$mode" = password ] || [ "$mode" = md5 ]; then export POSTGRES_PASSWORD_AUTHENTICATION=always; else unset POSTGRES_PASSWORD_AUTHENTICATION; fi
     owns_container=1
     # CI supplies a disposable trust-mode service. The authentication and
     # TLS fixtures below still use containers this script owns and configures.

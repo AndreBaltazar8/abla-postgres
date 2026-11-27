@@ -539,6 +539,8 @@ fun PgPool.handleAuthentication(slot: int, kind: int, body: string): void {
             } else this.connAuthenticated[slot] = true
         } else if ((method == 3 || method == 5) && this.config.channelBinding == "require") {
             this.closeConnection(slot, PG_BINDING_REFUSED)
+        } else if ((method == 3 || method == 5) && pgPasswordProblem(this.config, method) != "") {
+            this.closeConnection(slot, pgPasswordProblem(this.config, method))
         } else if (method == 3 && !this.connPasswordSent[slot]) {
             this.connPasswordSent[slot] = true
             this.queueOutput(slot, pgPasswordMessage(this.config.password))

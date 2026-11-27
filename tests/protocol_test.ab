@@ -4,10 +4,8 @@ import "abla/io"
 import "abla/process/time"
 import "abla/sys/linux/net"
 
-fun withReadTimeout(config: PgConfig, milliseconds: int): PgConfig = PgConfig(
-    config.host, config.port, config.database, config.user, config.password,
-    config.connectTimeoutMilliseconds, milliseconds
-)
+fun withReadTimeout(config: PgConfig, milliseconds: int): PgConfig =
+    pgConfigWithTimeouts(config, config.connectTimeoutMilliseconds, milliseconds)
 
 // How long a reply may take: the configured limit, one query's own, and that
 // neither cuts off a reply still arriving.

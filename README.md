@@ -73,6 +73,14 @@ a `PgConfig`'s `sslMode` and `sslRootCert`, or `POSTGRES_SSLMODE` and `POSTGRES_
 There's no fallback: a server without TLS, a certificate that doesn't check out, or a program that asks without
 having added it gets an error, not a plain connection. Nothing here links OpenSSL. The async pool uses the same TLS policy through nonblocking SSLRequest, handshake, authentication and query states. `detachConnection(slot)` transfers both the fd and its TLS handle for a dedicated LISTEN connection; copying only an fd is insufficient. A pool can receive `resolvedCandidates` from an off-loop resolver while retaining the original host names for certificate checks.
 
+### Password and MD5 authentication
+
+A server whose pg_hba.conf says `password` or `md5` asks the client for the password itself, or for its MD5. Whoever
+answers the connection can ask the same in place of the server's SCRAM, so by default (`PgConfig.passwordAuthentication`
+or `POSTGRES_PASSWORD_AUTHENTICATION` `verified`) the client answers only when sslmode is `verify-ca` or `verify-full`,
+and otherwise refuses with an error that says so. `always` answers as libpq does by default; `never` refuses it over any
+connection. SCRAM (`scram-sha-256`, PostgreSQL's default since 14) never sends the password and is not affected.
+
 ### Channel binding (SCRAM-SHA-256-PLUS)
 
 Over TLS, SCRAM can bind the password exchange to the TLS connection (RFC 5802, `tls-server-end-point` of RFC 5929, which
