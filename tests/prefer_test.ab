@@ -1,0 +1,147 @@
+import "../src/postgres.ab"
+import "../src/async.ab"
+import "../src/tls.ab"
+import "abla/io"
+import "abla/fs"
+import "abla/process/time"
+import "abla/sys/linux/net"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/text"
+
+// sslmode prefer, the default: a server that answers the SSLRequest with "N" (no TLS) is used in plain text, and there a request for the
+// password itself (cleartext or MD5) is still refused; a server that answers "S" gets TLS or nothing, never plain text. Both clients.
+// The server is this program run again as a child, in a mode: trust (AuthenticationOk, then answers one query), cleartext, md5, or
+// tls-then-close (says "S" and closes). It reports on its output each password it is sent and each startup it reads in plain text.
+
+trusted fun server(mode: string): int {
+    val listener=tcpListenAddress(Ipv4SocketAddress("127.0.0.1",0))
+    if(listener.descriptor<0) return 3
+    println("${listener.localPort()}")
+    val ready=pgTypedMessage(90,[73])
+    while(true) {
+        val peer=listener.accept()
+        val request=peer.readWithTimeoutResult(8,2000).bytes
+        if(request=="\x00\x00\x00\x08\x04\xd2\x16\x2f") {
+            if(mode=="tls-then-close") { peer.write("S"); sleep(100); peer.close(); continue }
+            peer.write("N")
+            val startup=peer.readWithTimeoutResult(4096,2000).bytes
+            if(startup.size>=8) {
+                println("plain-startup")
+                if(mode=="trust") {
+                    peer.write(pgTypedMessage(82,[0,0,0,0])+ready)
+                    if(peer.readWithTimeoutResult(65536,2000).bytes.size>0)
+                        peer.write(pgTypedMessage(84,[0,1,120,0,0,0,0,0,0,0,0,0,0,25,255,255,255,255,0,0])+pgTypedMessage(68,[0,1,0,0,0,1,49])+pgTypedMessage(67,[83,69,76,69,67,84,32,49,0])+ready)
+                } else {
+                    if(mode=="md5") peer.write(pgTypedMessage(82,[0,0,0,5,1,2,3,4]))
+                    else peer.write(pgTypedMessage(82,[0,0,0,3]))
+                    val answer=peer.readWithTimeoutResult(4096,1000).bytes
+                    if(answer.size>0 && answer[0]==112) println("password")
+                    peer.write(pgTypedMessage(69,[83,70,65,84,65,76,0,77,110,111,0,0]))
+                }
+            }
+        } else println("no-ssl-request")
+        sleep(100)
+        peer.close()
+    }
+    0
+}
+
+var failures = 0
+
+fun check(name: string, ok: bool): void {
+    if (!ok) {
+        println("FAIL $name")
+        failures = failures + 1
+    }
+    return
+}
+
+// The default PgConfig: sslMode prefer, passwordAuthentication verified.
+fun config(port: int): PgConfig = PgConfig("127.0.0.1",port,"test","test","secret",500,1000,targetSessionAttrs="any")
+
+fun blocking(port: int): PgResult {
+    val client=pgClient(config(port))
+    val result=client.query("SELECT 1")
+    client.close()
+    result
+}
+
+fun pooled(port: int): PgResult {
+    var pool=pgPool(config(port),PgPoolOptions(1,1000,200))
+    val id=pool.query("SELECT 1")
+    var result=PgResult(false,[],[],"","no result")
+    var loops=0
+    var found=false
+    while(!found && loops<300) {
+        pool.step(10)
+        for(item in pool.takeResults()) if(item.id==id) { result=item.result; found=true }
+        loops=loops+1
+    }
+    result
+}
+
+trusted fun lines(ready: string, line: string): int {
+    var count=0
+    for(each in linuxReadFile(ready,65536).split("\n")) if(each.trim()==line) count=count+1
+    count
+}
+
+class Running(val process: int, val port: int, val ready: string)
+
+trusted fun startServer(mode: string): Running {
+    val parent=linuxProcessId()
+    val ready="build/prefer-$mode-$parent.ready"
+    val child=linuxCommand("/proc/$parent/exe").argument("server").argument(mode).output(ready).start()
+    val readyDeadline=linuxMonotonicMilliseconds()+3000
+    var port=0
+    while(port<=0 && linuxMonotonicMilliseconds()<readyDeadline) { port=pgInt(linuxReadFile(ready,64).split("\n")[0].trim()); if(port<=0) sleep(5) }
+    check("server $mode started",port>0)
+    Running(child.process,port,ready)
+}
+
+trusted fun stopServer(server: Running): void {
+    linuxSyscall2(62,server.process,9)
+    linuxWaitProcess(server.process)
+    Path(server.ready).remove()
+    return
+}
+
+trusted fun main: int {
+    if(linuxArgument(0)=="server") return server(linuxArgument(1))
+    pgTlsEnable()
+    check("the default sslmode is prefer",PgConfig("h",1,"d","u","p").sslMode=="prefer" && pgConfigFromEnvironment().sslMode=="prefer")
+    check("prefer asks for TLS when the program has it",pgTlsAsked(PgConfig("h",1,"d","u","p")))
+    val trust=startServer("trust")
+    if(trust.port>0) {
+        val one=blocking(trust.port)
+        check("prefer falls back to plain text when the server has no TLS (blocking): ${one.error}",one.succeeded && one.rows.size==1 && one.rows[0][0].value=="1")
+        val two=pooled(trust.port)
+        check("prefer falls back to plain text when the server has no TLS (pool): ${two.error}",two.succeeded && two.rows.size==1)
+        sleep(200)
+        check("both asked for TLS first, then started in plain text",lines(trust.ready,"plain-startup")==2 && lines(trust.ready,"no-ssl-request")==0)
+    }
+    stopServer(trust)
+    for(mode in ["cleartext","md5"]) {
+        val asking=startServer(mode)
+        if(asking.port>0) {
+            val one=blocking(asking.port)
+            check("$mode refused after the plain-text fallback (blocking): ${one.error}",!one.succeeded && one.error.contains("not verified") && one.error.contains("sslmode prefer"))
+            val two=pooled(asking.port)
+            check("$mode refused after the plain-text fallback (pool): ${two.error}",!two.succeeded && two.error.contains("not verified"))
+            sleep(200)
+            check("$mode: no password reached the server",lines(asking.ready,"password")==0 && lines(asking.ready,"plain-startup")==2)
+        }
+        stopServer(asking)
+    }
+    val offering=startServer("tls-then-close")
+    if(offering.port>0) {
+        check("a server that said S is never used in plain text (blocking)",!blocking(offering.port).succeeded)
+        check("a server that said S is never used in plain text (pool)",!pooled(offering.port).succeeded)
+        sleep(200)
+        check("no plain-text startup after S",lines(offering.ready,"plain-startup")==0)
+    }
+    stopServer(offering)
+    if(failures==0) println("ok prefer")
+    if(failures==0) 0 else 1
+}

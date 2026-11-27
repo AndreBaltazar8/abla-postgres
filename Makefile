@@ -21,6 +21,8 @@ check:
 	build/result-limit-test
 	$(COMPILER) build tests/password_auth_test.ab -o build/password-auth-test --fast --no-cache
 	build/password-auth-test
+	$(COMPILER) build tests/prefer_test.ab -o build/prefer-test --fast --no-cache
+	build/prefer-test
 	$(COMPILER) build tests/pool_cache_test.ab -o build/pool-cache-test --fast --no-cache
 	build/pool-cache-test
 

@@ -25,11 +25,11 @@ private fun pgPureIndex(handle: int): int {
     -1
 }
 
-// Only sslmode require encrypts and checks nothing else; verify-ca checks the chain; everything else, verify-full and anything
+// sslmode require and prefer encrypt and check nothing else; verify-ca checks the chain; everything else, verify-full and anything
 // unknown, checks the chain and the name (an address is checked as one, against the certificate's IP entries, and is not sent
 // as a server name). The direction is the old one: a mode nobody listed is checked.
 private fun pgPureMode(mode: string): int =
-    if (mode == "require") TLS_VERIFY_NONE else if (mode == "verify-ca") TLS_VERIFY_CHAIN else TLS_VERIFY_HOST
+    if (mode == "require" || mode == "prefer") TLS_VERIFY_NONE else if (mode == "verify-ca") TLS_VERIFY_CHAIN else TLS_VERIFY_HOST
 
 private fun pgPureStatus(status: int): int = if (status == 1 || status == 2 || status == 3 || status == 0) status else -1
 

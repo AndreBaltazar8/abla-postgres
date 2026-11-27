@@ -776,7 +776,7 @@ fun PgPool.socketReady(slot: int, readable: bool, writable: bool, failed: bool):
                 this.closeConnection(slot, this.lastConnectError)
             } else {
                 this.interest(slot, false)
-                if(this.config.sslMode=="disable") {
+                if(!pgTlsAsked(this.config)) {
                     this.connStates[slot]=pgAsyncAuthenticating
                     this.queueOutput(slot,pgBytes(pgStartup(this.config)))
                 } else {
@@ -797,6 +797,12 @@ fun PgPool.socketReady(slot: int, readable: bool, writable: bool, failed: bool):
             val n=response.status
             val accepted=n==1 && response.text=="S"
             if(n==-11 || n==-4) return
+            // prefer: a server without TLS ("N") is used in plain text; one that said "S" gets TLS or nothing.
+            if(n==1 && response.text=="N" && this.config.sslMode=="prefer") {
+                this.connStates[slot]=pgAsyncAuthenticating
+                this.queueOutput(slot,pgBytes(pgStartup(this.config)))
+                return
+            }
             if(!accepted) { this.closeConnection(slot,"PostgreSQL candidate refused required TLS"); return }
             val candidate=pgCandidates(this.config)[this.connCandidates[slot]]
             val handle=pgTlsAdded[0].start(this.connDescriptors[slot],candidate.host,this.config.sslMode,this.config.sslRootCert)

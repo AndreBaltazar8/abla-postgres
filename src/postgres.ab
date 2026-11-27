@@ -21,9 +21,11 @@ class PgConfig(
     val password: string,
     val connectTimeoutMilliseconds: int = 3000,
     val readTimeoutMilliseconds: int = 5000,
-    // As libpq's: disable, require (encrypted, no check of who answers), verify-ca, verify-full.
-    // Anything but disable needs the "tls" subpath: see src/tls.ab. It never falls back to plain text.
-    val sslMode: string = "disable",
+    // As libpq's: disable; prefer (the default: TLS when the server offers it and the program has the "tls" subpath, else plain
+    // text; nothing is checked, so the password itself is never answered: see passwordAuthentication); require (encrypted, no check
+    // of who answers); verify-ca; verify-full. require and the verify modes need the "tls" subpath (src/tls.ab) and never fall back
+    // to plain text, and neither does prefer once a server has said it offers TLS.
+    val sslMode: string = "prefer",
     // The CA file of verify-ca and verify-full, or "system".
     val sslRootCert: string = "",
     // A candidate must prove it is writable before application SQL is sent.
@@ -301,7 +303,7 @@ fun pgConfigFromEnvironment(): PgConfig = PgConfig(
     pgSecretEnvironment("POSTGRES_PASSWORD", "POSTGRES_PASSWORD_FILE", ""),
     pgParsePositiveInt(pgEnvironment("POSTGRES_CONNECT_TIMEOUT_MS", "3000"), 3000),
     pgParsePositiveInt(pgEnvironment("POSTGRES_READ_TIMEOUT_MS", "5000"), 5000),
-    pgEnvironment("POSTGRES_SSLMODE", "disable"),
+    pgEnvironment("POSTGRES_SSLMODE", "prefer"),
     pgEnvironment("POSTGRES_SSLROOTCERT", ""),
     pgEnvironment("POSTGRES_TARGET_SESSION_ATTRS", "read-write"),
     "",
@@ -559,21 +561,26 @@ fun pgConnect(config: PgConfig): PgStream {
 
 fun pgTlsProblem(config: PgConfig): string {
     val mode = config.sslMode
-    if (mode == "disable") return ""
-    if (mode != "require" && mode != "verify-ca" && mode != "verify-full") return "Unknown PostgreSQL sslmode: $mode"
+    if (mode == "disable" || (mode == "prefer" && pgTlsAdded.size == 0)) return ""
+    if (mode != "prefer" && mode != "require" && mode != "verify-ca" && mode != "verify-full") return "Unknown PostgreSQL sslmode: $mode"
     if (pgTlsAdded.size == 0) return "sslmode $mode needs TLS, which this program doesn't have: import abla-postgres' tls subpath and call pgTlsEnable()"
-    if (mode != "require" && config.sslRootCert == "") return "sslmode $mode needs a CA file to check the server against"
+    if (mode != "prefer" && mode != "require" && config.sslRootCert == "") return "sslmode $mode needs a CA file to check the server against"
     ""
 }
 
+/// Whether a connection under `config` asks the server for TLS: every sslmode but disable, and prefer only when the program has TLS.
+fun pgTlsAsked(config: PgConfig): bool = config.sslMode != "disable" && !(config.sslMode == "prefer" && pgTlsAdded.size == 0)
+
 // Asks for TLS before anything else goes over the connection (the protocol's SSLRequest), and takes one byte of the
-// answer: anything sent behind it, in the clear, must not be read as if it had come over TLS (CVE-2021-23222).
+// answer: anything sent behind it, in the clear, must not be read as if it had come over TLS (CVE-2021-23222). Under prefer, a server
+// that answers "N" (no TLS) is used in plain text; one that answers "S" gets TLS or nothing, never a fallback.
 fun pgTlsNegotiate(var stream: PgStream, config: PgConfig, deadline: int = 0): string {
-    if (config.sslMode == "disable" || stream.connection.descriptor < 0) return ""
+    if (!pgTlsAsked(config) || stream.connection.descriptor < 0) return ""
     if (stream.connection.write("\x00\x00\x00\x08\x04\xd2\x16\x2f") < 0) return "Could not ask PostgreSQL for TLS"
     val readBudget = if (deadline > 0) pgRemaining(deadline,config.readTimeoutMilliseconds) else config.readTimeoutMilliseconds
     if (readBudget <= 0) return "PostgreSQL TLS connection deadline exceeded"
     val answer = stream.connection.readWithTimeoutResult(1, readBudget).bytes
+    if (answer == "N" && config.sslMode == "prefer") return ""
     if (answer != "S") return "PostgreSQL at ${config.host}:${config.port} doesn't offer TLS, and sslmode ${config.sslMode} requires it"
     val tls = pgTlsAdded[0]
     val budget = if (deadline > 0) pgRemaining(deadline,config.connectTimeoutMilliseconds) else config.connectTimeoutMilliseconds

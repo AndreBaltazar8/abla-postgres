@@ -59,19 +59,35 @@ During sibling-checkout development, import it directly:
 import "../../abla-postgres/src/postgres.ab"
 ```
 
+## Before you upgrade
+
+- **A server that authenticates with `password` or `md5` needs an opt-in, or verified TLS.** The client no longer
+  answers a request for the password itself, or for its MD5, unless `sslMode` is `verify-ca` or `verify-full`: whoever
+  answers an unverified connection could ask for it. Move the server to `scram-sha-256` (PostgreSQL's default since 14),
+  connect with `verify-full`, or set `PgConfig.passwordAuthentication` (or `POSTGRES_PASSWORD_AUTHENTICATION`) to
+  `always` for the old behaviour. The refusal says which.
+- **`sslMode` defaults to `prefer`**, as libpq's: with the `tls` subpath added, the client asks every server for TLS
+  and uses it when offered, and plain text otherwise. Set `disable` to keep never asking.
+- **A query's rows are bounded** by `PgConfig.maximumResultBytes`, 256 MiB by default: a larger result fails with an
+  error naming the option.
+
 
 ## TLS
 
 `import github("AndreBaltazar8/abla-postgres/tls")` and a call to `pgTlsEnable()` add it, and then
 a `PgConfig`'s `sslMode` and `sslRootCert`, or `POSTGRES_SSLMODE` and `POSTGRES_SSLROOTCERT`, ask for it:
 
-- `disable`, the default: plain;
+- `disable`: plain;
+- `prefer`, the default (as libpq's): encrypted when the server offers TLS and the program has added it, with no
+  check of who answers; plain text with a server that answers it has no TLS, or in a program without it;
 - `require`: encrypted, with no check of who answers;
 - `verify-ca`: the certificate chains to the CA file in `sslRootCert` (or `system`);
 - `verify-full`: that, and it names `host`, as a name or as an address.
 
-There's no fallback: a server without TLS, a certificate that doesn't check out, or a program that asks without
-having added it gets an error, not a plain connection. Nothing here links OpenSSL. The async pool uses the same TLS policy through nonblocking SSLRequest, handshake, authentication and query states. `detachConnection(slot)` transfers both the fd and its TLS handle for a dedicated LISTEN connection; copying only an fd is insufficient. A pool can receive `resolvedCandidates` from an off-loop resolver while retaining the original host names for certificate checks.
+Only `prefer` falls back, and only when the server answers that it has no TLS: a server that offers TLS and then
+fails the handshake gets an error, not a plain connection. Under `require` and the verify modes, a server without
+TLS, a certificate that doesn't check out, or a program that asks without having added it gets an error. Neither
+`prefer` nor `require` checks who answers, so the password itself is never sent there (see below). Nothing here links OpenSSL. The async pool uses the same TLS policy through nonblocking SSLRequest, handshake, authentication and query states. `detachConnection(slot)` transfers both the fd and its TLS handle for a dedicated LISTEN connection; copying only an fd is insufficient. A pool can receive `resolvedCandidates` from an off-loop resolver while retaining the original host names for certificate checks.
 
 ### Password and MD5 authentication
 
