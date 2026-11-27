@@ -18,6 +18,8 @@ trap cleanup EXIT INT TERM
 mkdir -p "$project_dir/build"
 "$compiler" build "$project_dir/tests/host_address_test.ab" -o "$project_dir/build/host-address-test" --fast --no-cache
 "$project_dir/build/host-address-test"
+"$compiler" build "$project_dir/tests/result_limit_test.ab" -o "$project_dir/build/result-limit-test" --fast --no-cache
+(cd "$project_dir" && build/result-limit-test)
 "$compiler" build "$project_dir/tests/protocol_test.ab" \
     -o "$project_dir/build/protocol-test" --fast --no-cache
 "$compiler" build "$project_dir/tests/auth_failure_test.ab" \

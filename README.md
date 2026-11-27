@@ -117,6 +117,8 @@ loses its connection. Outside an explicit transaction, the next operation can op
 another; statements are never automatically replayed. PostgreSQL may keep
 working on it, so set `statement_timeout` where that matters. A single message
 over 16 MiB is refused with an error that says so, and also loses its connection.
+So is a result whose rows add up to more than `PgConfig.maximumResultBytes` (default
+256 MiB): no rows are returned, and larger results are read in pieces (`LIMIT`, a cursor).
 
 ```abla
 import github("AndreBaltazar8/abla-postgres")

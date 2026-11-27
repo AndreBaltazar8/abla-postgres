@@ -1,0 +1,96 @@
+import "../src/postgres.ab"
+import "../src/async.ab"
+import "abla/io"
+import "abla/fs"
+import "abla/process/time"
+import "abla/sys/linux/net"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/text"
+
+// PgConfig.maximumResultBytes: a server that answers a query with more row bytes than the bound (a hostile one, or anyone on a path TLS does
+// not authenticate) fails the query and closes the connection, in the blocking client and the pool; within the bound the rows arrive.
+// The server is this program run again as a child: it answers every query with 100 rows of 1 KiB.
+
+fun dataRow(size: int): string {
+    val body: array<int> = []
+    pgAppendU16(body, 1)
+    pgAppendU32(body, size)
+    pgAppendText(body, "x".repeat(size))
+    pgTypedMessage(68, body)
+}
+
+trusted fun server(): int {
+    val listener=tcpListenAddress(Ipv4SocketAddress("127.0.0.1",0))
+    if(listener.descriptor<0) return 3
+    println("${listener.localPort()}")
+    val rows=dataRow(1024).repeat(100)
+    val complete=pgTypedMessage(67,[83,69,76,69,67,84,32,49,48,48,0])
+    val ready=pgTypedMessage(90,[73])
+    for(connection in 0 until 4) {
+        val peer=listener.accept()
+        if(peer.readWithTimeoutResult(4096,2000).bytes.size<8) return 4
+        peer.write(pgTypedMessage(82,[0,0,0,0])+ready)
+        var open=true
+        while(open) {
+            val chunk=peer.readWithTimeoutResult(65536,2000)
+            if(chunk.bytes.size==0) open=false
+            else peer.write(rows+complete+ready)
+        }
+        peer.close()
+    }
+    0
+}
+
+fun config(port: int, limit: int): PgConfig =
+    PgConfig("127.0.0.1",port,"test","test","",500,2000,"disable","","any",maximumResultBytes=limit)
+
+trusted fun main: int {
+    if(linuxArgument(0)=="server") return server()
+    val parent=linuxProcessId()
+    val ready="build/result-limit-$parent.ready"
+    val child=linuxCommand("/proc/$parent/exe").argument("server").output(ready).start()
+    val readyDeadline=linuxMonotonicMilliseconds()+3000
+    var port=0
+    while(port<=0 && linuxMonotonicMilliseconds()<readyDeadline) { port=pgInt(linuxReadFile(ready,64).trim()); if(port<=0) sleep(5) }
+    var failures=0
+    if(port<=0) failures=failures+1
+    else {
+        // Blocking client: past the bound the query fails, naming the option; within it all 100 rows arrive.
+        val limited=pgClient(config(port,4096))
+        val refused=limited.query("SELECT rows")
+        limited.close()
+        if(refused.succeeded || !refused.error.contains("maximumResultBytes") || refused.rows.size!=0) {
+            println("FAIL a result past the bound: succeeded=${refused.succeeded} rows=${refused.rows.size} error=${refused.error}")
+            failures=failures+1
+        }
+        val roomy=pgClient(config(port,pgDefaultMaximumResultBytes))
+        val whole=roomy.query("SELECT rows")
+        roomy.close()
+        if(!whole.succeeded || whole.rows.size!=100) {
+            println("FAIL a result within the bound: succeeded=${whole.succeeded} rows=${whole.rows.size} error=${whole.error}")
+            failures=failures+1
+        }
+        // The pool: the same.
+        var pool=pgPool(config(port,4096),PgPoolOptions(1,1000,200))
+        val id=pool.query("SELECT rows")
+        var result=PgResult(false,[],[],"","no result")
+        var loops=0
+        var found=false
+        while(!found && loops<500) {
+            pool.step(10)
+            for(item in pool.takeResults()) if(item.id==id) { result=item.result; found=true }
+            loops=loops+1
+        }
+
+        if(!found || result.succeeded || !result.error.contains("maximumResultBytes")) {
+            println("FAIL the pool past the bound: found=$found succeeded=${result.succeeded} error=${result.error}")
+            failures=failures+1
+        }
+    }
+    linuxSyscall2(62,child.process,9)
+    linuxWaitProcess(child.process)
+    Path(ready).remove()
+    if(failures==0) println("ok result limit")
+    if(failures==0) 0 else 1
+}

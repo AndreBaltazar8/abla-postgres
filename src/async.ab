@@ -121,7 +121,9 @@ resource class PgPool(
     val connNotifications: array<string>,
     // The GS2 header and the channel-binding data of a connection's SCRAM exchange (postgres.ab pgSaslChoose).
     val connGs2Headers: array<string>,
-    val connBindings: array<string>
+    val connBindings: array<string>,
+    // The DataRow bytes of the query a connection is answering, against config.maximumResultBytes.
+    val connResultBytes: array<int> = []
 ) {
     fun drop(): void {
         var slot = 0
@@ -480,6 +482,7 @@ fun PgPool.openConnection(): int {
         this.connAuthenticated.append(false)
         this.connColumns.append([])
         this.connRows.append([])
+        this.connResultBytes.append(0)
         this.connCommands.append("")
         this.connErrors.append("")
         this.connSqlStates.append("")
@@ -597,6 +600,7 @@ fun PgPool.handleAuthentication(slot: int, kind: int, body: string): void {
                 this.connStates[slot] = pgAsyncChecking
                 this.connColumns[slot] = []
                 this.connRows[slot] = []
+                this.connResultBytes[slot] = 0
                 this.connErrors[slot] = ""
                 this.queueOutput(slot,pgExtendedQuery("SHOW transaction_read_only",[]))
             } else this.targetReady(slot)
@@ -617,11 +621,20 @@ fun PgPool.targetReady(slot: int): void {
 
 fun PgPool.handleTarget(slot: int, kind: int, body: string): void {
     if (kind == 69) this.connErrors[slot] = pgErrorMessage(body)
-    else if (kind == 68) this.connRows[slot].append(pgParseRow(body))
+    else if (kind == 68) {
+        // The probe answers one row; a server that sends more past maximumResultBytes is closed as a query would be.
+        this.connResultBytes[slot] = this.connResultBytes[slot] + body.size
+        if (this.connResultBytes[slot] > this.config.maximumResultBytes) {
+            this.closeConnection(slot, "PostgreSQL returned more than ${this.config.maximumResultBytes} bytes of rows (PgConfig.maximumResultBytes)")
+            return
+        }
+        this.connRows[slot].append(pgParseRow(body))
+    }
     else if (kind == 90) {
         val rows = this.connRows[slot]
         val writable = this.connErrors[slot] == "" && body.size == 1 && body[0] == 73 && rows.size == 1 && rows[0].size == 1 && !rows[0][0].isNull && rows[0][0].value == "off"
         this.connRows[slot] = []
+        this.connResultBytes[slot] = 0
         if (writable) this.targetReady(slot)
         else this.closeConnection(slot,"PostgreSQL candidate is not a writable target")
     }
@@ -637,6 +650,11 @@ fun PgPool.handleQueryMessage(slot: int, kind: int, body: string): void {
     } else if (kind == 84 && this.connErrors[slot] == "") {
         this.connColumns[slot] = pgParseColumns(body)
     } else if (kind == 68 && this.connErrors[slot] == "") {
+        this.connResultBytes[slot] = this.connResultBytes[slot] + body.size
+        if (this.connResultBytes[slot] > this.config.maximumResultBytes) {
+            this.closeConnection(slot, "PostgreSQL returned more than ${this.config.maximumResultBytes} bytes of rows (PgConfig.maximumResultBytes): read the result in pieces")
+            return
+        }
         this.connRows[slot].append(pgParseRow(body))
     } else if (kind == 67 && body.size > 0 && this.connErrors[slot] == "") {
         this.connCommands[slot] = body.slice(0, body.size - 1)
@@ -664,6 +682,7 @@ fun PgPool.handleQueryMessage(slot: int, kind: int, body: string): void {
         )
         this.connColumns[slot] = []
         this.connRows[slot] = []
+        this.connResultBytes[slot] = 0
         this.connCommands[slot] = ""
         this.connErrors[slot] = ""
         this.connSqlStates[slot] = ""
@@ -820,6 +839,7 @@ fun PgPool.startOp(slot: int, op: int): void {
     this.connStates[slot] = pgAsyncBusy
     this.connColumns[slot] = []
     this.connRows[slot] = []
+    this.connResultBytes[slot] = 0
     this.connCommands[slot] = ""
     this.connErrors[slot] = ""
     this.connSqlStates[slot] = ""

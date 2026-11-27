@@ -33,7 +33,11 @@ class PgConfig(
     val hostAddress: string = "",
     // As libpq's channel_binding: prefer (SCRAM-SHA-256-PLUS when the connection is TLS and the server offers it), require
     // (only that: any other way of authenticating is refused) or disable (plain SCRAM-SHA-256).
-    val channelBinding: string = "prefer"
+    val channelBinding: string = "prefer",
+    // The bytes of the rows one query may return (their DataRow messages, over all statements of a pipeline): past it the query fails and the
+    // connection closes, so a server, or anyone on a path it does not authenticate, cannot stream rows until the client runs out of memory.
+    // Read larger results in pieces (LIMIT, a cursor).
+    val maximumResultBytes: int = pgDefaultMaximumResultBytes
 )
 
 // Keep connection policy when giving a dedicated checkpoint/lease session its
@@ -41,7 +45,8 @@ class PgConfig(
 // host-selection policy is added.
 fun pgConfigWithTimeouts(config: PgConfig, connectMilliseconds: int, readMilliseconds: int): PgConfig = PgConfig(
     config.host,config.port,config.database,config.user,config.password,
-    connectMilliseconds,readMilliseconds,config.sslMode,config.sslRootCert,config.targetSessionAttrs,config.hostAddress,config.channelBinding
+    connectMilliseconds,readMilliseconds,config.sslMode,config.sslRootCert,config.targetSessionAttrs,config.hostAddress,config.channelBinding,
+    config.maximumResultBytes
 )
 
 class PgCandidate(val host: string, val port: int)
@@ -78,7 +83,8 @@ fun pgCandidates(config: PgConfig): array<PgCandidate> {
 
 fun pgCandidateConfig(config: PgConfig, candidate: PgCandidate, connectMilliseconds: int): PgConfig = PgConfig(
     candidate.host,candidate.port,config.database,config.user,config.password,
-    connectMilliseconds,config.readTimeoutMilliseconds,config.sslMode,config.sslRootCert,config.targetSessionAttrs,config.hostAddress,config.channelBinding
+    connectMilliseconds,config.readTimeoutMilliseconds,config.sslMode,config.sslRootCert,config.targetSessionAttrs,config.hostAddress,config.channelBinding,
+    config.maximumResultBytes
 )
 
 fun pgRemaining(deadline: int, maximum: int): int {
@@ -357,6 +363,9 @@ fun pgReadU32(value: string, offset: int): int =
     value[offset + 2] * 256 + value[offset + 3]
 
 val pgLargestMessage = 16777216
+
+// PgConfig.maximumResultBytes' default: 256 MiB of rows a query.
+val pgDefaultMaximumResultBytes = 268435456
 val pgOversizedMessage = -1
 
 // Waits at most `timeoutMilliseconds` for each piece of the message to arrive, so
@@ -1225,6 +1234,8 @@ private fun PgClient.exchange(request: string, replyTimeout: int, control: int, 
     var sent = false
     // Statements of a pipeline that completed: only the last one's rows are kept.
     var completed = 0
+    // The DataRow bytes so far, against config.maximumResultBytes.
+    var resultBytes = 0
     this.parsed = 0
     this.completed = 0
     if (error == "") {
@@ -1260,7 +1271,12 @@ private fun PgClient.exchange(request: string, replyTimeout: int, control: int, 
                 index = index + 1
             }
         } else if (message.kind == 68 && error == "") {
-            rows.append(pgParseRow(message.body))
+            resultBytes = resultBytes + message.body.size
+            if (resultBytes > this.config.maximumResultBytes) {
+                error = "PostgreSQL returned more than ${this.config.maximumResultBytes} bytes of rows (PgConfig.maximumResultBytes): read the result in pieces"
+                rows.clear()
+                transportFailed = true
+            } else rows.append(pgParseRow(message.body))
         } else if (message.kind == 67 && message.body.size > 0 &&
             error == "") {
             command = message.body.slice(0, message.body.size - 1)
