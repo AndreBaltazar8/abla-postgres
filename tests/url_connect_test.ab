@@ -1,0 +1,18 @@
+// Connects with the config pgConfigFromUrl makes of PG_TEST_URL: an answer over TLS prints "ssl", a plain one "plain", and a refusal its
+// error. tools/test-postgres.sh runs it against a server that authenticates with password, md5 and scram-sha-256.
+import "abla/io"
+import "../src/postgres.ab"
+import "../src/async.ab"
+import "../src/tls.ab"
+
+fun main: int {
+    pgTlsEnable()
+    val config = pgConfigFromUrl(pgEnvironment("PG_TEST_URL", ""))
+    val asked = pgQuery(config, "SELECT ssl::text AS ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()")
+    if (!asked.succeeded) {
+        println("refused: ${asked.error}")
+        return 1
+    }
+    println(if (asked.first("ssl") == "true") "ssl" else "plain")
+    0
+}

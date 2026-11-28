@@ -334,4 +334,64 @@ run_binding() {
 relays=''
 run_binding
 
+# Password and MD5 against a real server, configured by URL: by default the client answers them only over verify-ca or verify-full;
+# password_authentication changes that; SCRAM is answered over any connection. A key the URL parser does not take refuses.
+run_url_auth() {
+    "$compiler" build "$project_dir/tests/url_connect_test.ab" -o "$project_dir/build/url-connect-test" --fast --no-cache
+    work=$(mktemp -d)
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work/ca.key" -out "$work/ca.pem" -days 2 -subj "/CN=ca" 2>/dev/null
+    openssl req -new -newkey rsa:2048 -nodes -keyout "$work/server.key" -out "$work/server.csr" -subj "/CN=localhost" 2>/dev/null
+    printf 'subjectAltName=DNS:localhost\n' > "$work/server.ext"
+    openssl x509 -req -in "$work/server.csr" -CA "$work/ca.pem" -CAkey "$work/ca.key" -CAcreateserial -days 2 -extfile "$work/server.ext" -out "$work/server.pem" 2>/dev/null
+    container="abla-postgres-url-$$"
+    containers="$containers $container"
+    docker run -d --rm --name "$container" -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=abla_test -p 127.0.0.1::5432 postgres:16-alpine >/dev/null
+    port=$(docker port "$container" 5432/tcp | sed 's/.*://')
+    until docker exec "$container" pg_isready -h 127.0.0.1 -U postgres -d abla_test >/dev/null 2>&1; do sleep 1; done
+    docker cp "$work/server.pem" "$container:/tmp/server.pem" >/dev/null
+    docker cp "$work/server.key" "$container:/tmp/server.key" >/dev/null
+    docker exec "$container" chown postgres /tmp/server.pem /tmp/server.key
+    docker exec "$container" chmod 600 /tmp/server.key
+    docker exec "$container" psql -U postgres -d abla_test -v ON_ERROR_STOP=1 \
+        -c "ALTER SYSTEM SET ssl=on" -c "ALTER SYSTEM SET ssl_cert_file='/tmp/server.pem'" -c "ALTER SYSTEM SET ssl_key_file='/tmp/server.key'" >/dev/null
+    url="postgres://postgres:$password@localhost:$port/abla_test"
+    ca=$(printf '%s' "$work/ca.pem" | sed 's|/|%2F|g')
+    expect_url() { # WHAT MODE QUERY
+        got=$(PG_TEST_URL="$url?$3" "$project_dir/build/url-connect-test" 2>&1 || true)
+        case "$got" in
+            "$1"*) echo "ok   url $2 ?$3: $1" ;;
+            *) echo "FAIL url $2 ?$3: wanted $1, got $got"; exit 1 ;;
+        esac
+    }
+    previous=trust
+    for mode in password md5 scram-sha-256; do
+        encryption=$([ "$mode" = md5 ] && echo md5 || echo scram-sha-256)
+        docker exec "$container" psql -U postgres -d abla_test -v ON_ERROR_STOP=1 \
+            -c "SET password_encryption='$encryption'; ALTER USER postgres PASSWORD '$password';" >/dev/null
+        # TCP lines only: psql in the container keeps its trusted local socket for the next mode's setup.
+        docker exec "$container" sed -i "/^host/s/$previous\$/$mode/" /var/lib/postgresql/data/pg_hba.conf
+        docker exec "$container" psql -U postgres -d abla_test -c 'SELECT pg_reload_conf()' >/dev/null
+        previous=$mode
+        sleep 1
+        if [ "$mode" = scram-sha-256 ]; then
+            expect_url plain "$mode" "sslmode=disable"
+            expect_url ssl "$mode" "sslmode=prefer"
+        else
+            expect_url "refused: PostgreSQL asked for" "$mode" "sslmode=disable"
+            expect_url "refused: PostgreSQL asked for" "$mode" "sslmode=prefer"
+            expect_url "refused: PostgreSQL asked for" "$mode" "sslmode=require"
+            expect_url plain "$mode" "sslmode=disable&password_authentication=always"
+            expect_url "refused: PostgreSQL asked for" "$mode" "sslmode=verify-full&sslrootcert=$ca&password_authentication=never"
+        fi
+        expect_url ssl "$mode" "sslmode=verify-full&sslrootcert=$ca"
+        expect_url ssl "$mode" "sslmode=verify-ca&sslrootcert=$ca"
+        expect_url "refused: Unknown PostgreSQL sslmode" "$mode" "ssl_mode=verify-full&sslrootcert=$ca"
+    done
+    docker stop "$container" >/dev/null
+    containers=$(printf '%s' "$containers" | sed "s/ $container//")
+    rm -r "$work"
+    echo "abla-postgres: URL authentication passed"
+}
+[ "${PG_TEST_BINDING_ONLY:-}" = 1 ] || run_url_auth
+
 echo "abla-postgres: all PostgreSQL 16 integration tests passed"
