@@ -170,7 +170,10 @@ fun PgPool.detachConnection(slot: int): PgDetachedConnection {
     detached
 }
 
-// postgres://user:password@host:port/database (percent-encoded parts allowed).
+// postgres://user:password@host:port/database?key=value&... (percent-encoded parts allowed). The query takes libpq's names: sslmode,
+// sslrootcert, channel_binding, target_session_attrs, hostaddr and connect_timeout (seconds), and password_authentication for
+// PgConfig.passwordAuthentication. Any other key, or one without a value, is refused: the config's sslmode then names it, so connecting
+// fails ("Unknown PostgreSQL sslmode: ...") rather than running with a setting the URL meant to change left at its default.
 fun pgConfigFromUrl(url: string): PgConfig {
     var rest = url
     if (textFindSequence(url, "postgres://", 0, url.size) == 0) rest = url.slice(11, url.size)
@@ -179,7 +182,11 @@ fun pgConfigFromUrl(url: string): PgConfig {
     }
     var user = "postgres"
     var password = ""
-    val at = textFindByte(rest, 64, 0, rest.size)
+    // The credentials end at the authority's last @: an @ in the path or the query (a CA file's name) is not one.
+    var authorityEnd = 0
+    while (authorityEnd < rest.size && rest[authorityEnd] != 47 && rest[authorityEnd] != 63) authorityEnd = authorityEnd + 1
+    var at = -1
+    for (index in 0 until authorityEnd) if (rest[index] == 64) at = index
     if (at >= 0) {
         val credentials = rest.slice(0, at)
         rest = rest.slice(at + 1, rest.size)
@@ -189,12 +196,16 @@ fun pgConfigFromUrl(url: string): PgConfig {
             password = pgAsyncPercentDecode(credentials.slice(colon + 1, credentials.size))
         } else user = pgAsyncPercentDecode(credentials)
     }
+    var query = ""
+    val question = textFindByte(rest, 63, 0, rest.size)
+    if (question >= 0) {
+        query = rest.slice(question + 1, rest.size)
+        rest = rest.slice(0, question)
+    }
     var slash = textFindByte(rest, 47, 0, rest.size)
     if (slash < 0) slash = rest.size
     val hostPort = rest.slice(0, slash)
     var database = if (slash < rest.size) rest.slice(slash + 1, rest.size) else ""
-    val question = textFindByte(database, 63, 0, database.size)
-    if (question >= 0) database = database.slice(0, question)
     var host = hostPort
     var port = 5432
     val colon = textFindByte(hostPort, 58, 0, hostPort.size)
@@ -204,7 +215,42 @@ fun pgConfigFromUrl(url: string): PgConfig {
     }
     if (host == "") host = "127.0.0.1"
     if (database == "") database = user
-    PgConfig(host, port, pgAsyncPercentDecode(database), user, password)
+    var connectMilliseconds = 3000
+    var sslMode = "prefer"
+    var sslRootCert = ""
+    var targetSessionAttrs = "read-write"
+    var hostAddress = ""
+    var channelBinding = "prefer"
+    var passwordAuthentication = "verified"
+    var refused = ""
+    var start = 0
+    while (start < query.size) {
+        var end = textFindByte(query, 38, start, query.size)
+        if (end < 0) end = query.size
+        val pair = query.slice(start, end)
+        start = end + 1
+        if (pair == "") continue
+        val equals = textFindByte(pair, 61, 0, pair.size)
+        val key = pgAsyncPercentDecode(if (equals >= 0) pair.slice(0, equals) else pair)
+        val value = if (equals >= 0) pgAsyncPercentDecode(pair.slice(equals + 1, pair.size)) else ""
+        if (equals < 0 && refused == "") refused = key
+        else if (key == "sslmode") sslMode = value
+        else if (key == "sslrootcert") sslRootCert = value
+        else if (key == "channel_binding") channelBinding = value
+        else if (key == "target_session_attrs") targetSessionAttrs = value
+        else if (key == "hostaddr") hostAddress = value
+        else if (key == "password_authentication") passwordAuthentication = value
+        else if (key == "connect_timeout") {
+            val seconds = pgParsePositiveInt(value, -1)
+            if (seconds > 0) connectMilliseconds = seconds * 1000
+            else if (refused == "") refused = "connect_timeout=$value"
+        } else if (refused == "") refused = key
+    }
+    if (refused != "") sslMode = "(URL parameter $refused is not one pgConfigFromUrl takes)"
+    PgConfig(
+        host, port, pgAsyncPercentDecode(database), user, password, connectMilliseconds, 5000, sslMode, sslRootCert,
+        targetSessionAttrs, hostAddress, channelBinding, passwordAuthentication = passwordAuthentication
+    )
 }
 
 fun pgAsyncHex(byte: int): int {

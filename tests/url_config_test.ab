@@ -1,0 +1,58 @@
+import "../src/postgres.ab"
+import "../src/async.ab"
+import "abla/io"
+import "abla/text"
+
+// pgConfigFromUrl reads the URL's query (libpq's names), so a URL alone can ask for verify-full, a CA file, channel binding or the
+// password policy; a key it does not take leaves the config unable to connect instead of quietly at its defaults.
+
+var failures = 0
+
+fun check(name: string, ok: bool): void {
+    if (!ok) {
+        println("FAIL $name")
+        failures = failures + 1
+    }
+    return
+}
+
+fun main: int {
+    val plain = pgConfigFromUrl("postgres://app:s%40cret@db.example:6543/shop")
+    check("plain: host, port, database, user, password",
+        plain.host == "db.example" && plain.port == 6543 && plain.database == "shop" && plain.user == "app" && plain.password == "s@cret")
+    check("plain: defaults", plain.sslMode == "prefer" && plain.sslRootCert == "" && plain.channelBinding == "prefer" &&
+        plain.passwordAuthentication == "verified" && plain.targetSessionAttrs == "read-write" && plain.connectTimeoutMilliseconds == 3000)
+    check("plain: no problem", pgTlsProblem(plain) == "")
+
+    val full = pgConfigFromUrl("postgresql://app@db.example/shop?sslmode=verify-full&sslrootcert=%2Fetc%2Fssl%2Fdb.pem&channel_binding=require" +
+        "&password_authentication=never&target_session_attrs=any&hostaddr=10.0.0.5&connect_timeout=7")
+    check("query: database stops at ?", full.database == "shop")
+    check("query: sslmode", full.sslMode == "verify-full")
+    check("query: sslrootcert decoded", full.sslRootCert == "/etc/ssl/db.pem")
+    check("query: channel_binding", full.channelBinding == "require")
+    check("query: password_authentication", full.passwordAuthentication == "never")
+    check("query: target_session_attrs", full.targetSessionAttrs == "any")
+    check("query: hostaddr", full.hostAddress == "10.0.0.5")
+    check("query: connect_timeout in seconds", full.connectTimeoutMilliseconds == 7000)
+
+    val always = pgConfigFromUrl("postgres://app:pw@h/d?password_authentication=always&sslmode=require")
+    check("an MD5 server can be answered when the URL says so", pgPasswordProblem(always, 5) == "")
+    check("by default it is not", pgPasswordProblem(pgConfigFromUrl("postgres://app:pw@h/d"), 5) != "")
+
+    val atInQuery = pgConfigFromUrl("postgres://app:pw@h/d?sslmode=verify-ca&sslrootcert=/srv/ca@2026.pem")
+    check("an @ in the query is not the credentials' end",
+        atInQuery.user == "app" && atInQuery.password == "pw" && atInQuery.host == "h" && atInQuery.sslRootCert == "/srv/ca@2026.pem")
+    check("no credentials, @ in the query", pgConfigFromUrl("postgres://h/d?sslrootcert=a@b").host == "h")
+
+    val noDatabase =pgConfigFromUrl("postgres://app@h?sslmode=disable")
+    check("query without a database path", noDatabase.host == "h" && noDatabase.sslMode == "disable" && noDatabase.database == "app")
+
+    for (url in ["postgres://h/d?ssl_mode=verify-full", "postgres://h/d?sslmode=verify-full&sslrootcert", "postgres://h/d?connect_timeout=soon",
+        "postgres://h/d?sslmode=disable&application_name=x"]) {
+        val config = pgConfigFromUrl(url)
+        check("refused: $url", textFindSequence(pgTlsProblem(config), "Unknown PostgreSQL sslmode", 0, pgTlsProblem(config).size) == 0)
+    }
+
+    if (failures == 0) println("url config: all checks passed")
+    if (failures == 0) 0 else 1
+}

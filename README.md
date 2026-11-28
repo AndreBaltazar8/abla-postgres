@@ -72,6 +72,14 @@ import "../../abla-postgres/src/postgres.ab"
   error naming the option.
 
 
+## Configuring from a URL
+
+`pgConfigFromUrl("postgres://user:password@host:port/database?sslmode=verify-full&sslrootcert=/etc/ssl/db.pem")` reads the
+query by libpq's names: `sslmode`, `sslrootcert`, `channel_binding`, `target_session_attrs`, `hostaddr` and
+`connect_timeout` (seconds), plus `password_authentication` for `PgConfig.passwordAuthentication`. Parts may be
+percent-encoded. A URL with any other key, or a key without a value, gets a config that refuses to connect, with an
+error that names the key, so a misspelt `sslmode` doesn't leave the connection at `prefer`.
+
 ## TLS
 
 `import github("AndreBaltazar8/abla-postgres/tls")` and a call to `pgTlsEnable()` add it, and then
